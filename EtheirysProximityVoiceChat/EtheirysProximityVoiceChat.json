@@ -1,0 +1,14 @@
+{
+  "Author": "phys1ks, Mayo Botic, Ultranova Violet",
+  "Name": "EtheirysProximityVoiceChat",
+  "Punchline":  "Spatial voice chat for FFXIV.",
+  "Description": "A proximity-based in-game voice chat plugin for FFXIV that connects nearby players, tracks voice-room presence, and supports local profile details and voice indicators.",
+  "RepoUrl": "",
+  "IconUrl": "",
+  "InternalName": "EtheirysProximityVoiceChat",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "proximity",
+    "vc"
+  ]
+}
