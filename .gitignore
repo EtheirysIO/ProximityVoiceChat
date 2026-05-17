@@ -1,0 +1,10 @@
+.vs/
+obj/
+bin/
+build/
+*.user
+
+# Live signaling URL + token for the maintainer's build. Kept out of
+# source history; contributors create their own EmbeddedConfig.cs from
+# the tracked EmbeddedConfig.example.cs template.
+EmbeddedConfig.cs

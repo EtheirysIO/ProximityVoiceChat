@@ -1,0 +1,4 @@
+{
+  "signalingServerUrl": "https://voice.etheirys.io",
+  "signalingServerToken": "REPLACE_ME_WITH_THE_DEPLOYMENT_TOKEN"
+}
