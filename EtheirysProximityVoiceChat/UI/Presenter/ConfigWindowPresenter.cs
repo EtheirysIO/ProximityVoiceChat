@@ -72,6 +72,13 @@ public class ConfigWindowPresenter(
             this.configuration.PushToTalk);
         Bind(this.view.SuppressNoise,
             b => { this.configuration.SuppressNoise = b; this.configuration.Save(); }, this.configuration.SuppressNoise);
+        Bind(this.view.VadSensitivity,
+            v =>
+            {
+                this.configuration.VadSensitivity = v;
+                this.configuration.Save();
+                this.audioDeviceController.SetVadOperatingMode(v);
+            }, this.configuration.VadSensitivity);
 
         Bind(this.view.MasterVolume,
             f => { this.configuration.MasterVolume = f; this.configuration.Save(); }, this.configuration.MasterVolume);
@@ -152,6 +159,7 @@ public class ConfigWindowPresenter(
             this.audioDeviceController.AudioPlaybackDeviceIndex = -1;
 
             this.view.SuppressNoise.Value = true;
+            this.view.VadSensitivity.Value = 2;
             this.view.PushToTalk.Value = false;
 
             this.configuration.PushToTalkBinding = new KeyBinding();

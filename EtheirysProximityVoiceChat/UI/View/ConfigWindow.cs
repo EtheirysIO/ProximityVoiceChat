@@ -56,6 +56,7 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
     public IReactiveProperty<bool> PlayingBackMicAudio { get; } = new ReactiveProperty<bool>();
     public IReactiveProperty<bool> PushToTalk { get; } = new ReactiveProperty<bool>();
     public IReactiveProperty<bool> SuppressNoise { get; } = new ReactiveProperty<bool>();
+    public IReactiveProperty<int> VadSensitivity { get; } = new ReactiveProperty<int>();
     public IReactiveProperty<Keybind> KeybindBeingEdited { get; } = new ReactiveProperty<Keybind>();
     public IObservable<Keybind> ClearKeybind => clearKeybind.AsObservable();
     private readonly Subject<Keybind> clearKeybind = new();
@@ -96,6 +97,20 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
     private string[]? inputDevices;
     private string[]? outputDevices;
     private string loadedProfileKey = string.Empty;
+    /// <summary>
+    /// Timestamp (<see cref="Environment.TickCount64"/>) of the most recent
+    /// frame where <see cref="IAudioDeviceController.RecordingDataHasActivity"/>
+    /// was true. Used by the inline pickup indicator next to the VAD slider so
+    /// the dot doesn't flicker during natural phoneme gaps (the underlying VAD
+    /// oscillates per 20ms frame).
+    /// </summary>
+    private long lastPickupTickMs;
+    /// <summary>
+    /// Hold window for the pickup indicator. Matches
+    /// <c>NameplateVoiceOverlay.SpeakingHoldMs</c> so the visual cadence is
+    /// consistent across the plugin.
+    /// </summary>
+    private const long PickupIndicatorHoldMs = 220;
     private readonly Vector4[] colorPalette = new[]
     {
         new Vector4(1.0f, 0.0f, 0.0f, 1.0f), // Red
@@ -246,6 +261,31 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
             {
                 this.SuppressNoise.Value = suppressNoise;
             }
+
+            // Pickup sensitivity slider + live indicator. Slider maps directly
+            // to WebRtcVadSharp.OperatingMode (0..3). Format string is computed
+            // each frame from VadStopName so dragging the slider updates the
+            // displayed name in place of the raw integer.
+            var vadMode = this.VadSensitivity.Value;
+            ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.55f);
+            if (ImGui.SliderInt("##VadSensitivity", ref vadMode, 0, 3, VadStopName(vadMode)))
+            {
+                this.VadSensitivity.Value = vadMode;
+            }
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip(
+                    "Quality (0): picks up quieter speech, lets more through.\n" +
+                    "Aggressive (2): default, balanced.\n" +
+                    "Very Aggressive (3): rejects more background noise, requires louder speech.\n" +
+                    "\n" +
+                    "Requires Noise Suppression to be enabled.\n" +
+                    "Push-to-Talk overrides voice-activated pickup.");
+            }
+            ImGui.SameLine();
+            DrawPickupIndicator();
+            ImGui.SameLine();
+            ImGui.TextUnformatted("Pickup sensitivity");
 
             var pushToTalk = this.PushToTalk.Value;
             if (ImGui.Checkbox("Push to Talk", ref pushToTalk))
@@ -927,5 +967,46 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
         }
     }
 
+    /// <summary>
+    /// Human-readable label for each WebRTC VAD operating mode position.
+    /// Out-of-range values fall back to the historical Aggressive default so
+    /// the slider never renders a blank label.
+    /// </summary>
+    private static string VadStopName(int mode) => mode switch
+    {
+        0 => "Quality",
+        1 => "Low Bitrate",
+        2 => "Aggressive",
+        3 => "Very Aggressive",
+        _ => "Aggressive",
+    };
+
+    /// <summary>
+    /// Draws a small filled circle next to the VAD slider: green when the
+    /// self-VAD is currently flagging speech, gray otherwise. Smoothed by a
+    /// 220ms hold (<see cref="PickupIndicatorHoldMs"/>) because the underlying
+    /// WebRTC VAD oscillates per 20ms frame during natural speech and would
+    /// otherwise produce a flickering dot.
+    /// </summary>
+    private void DrawPickupIndicator()
+    {
+        var nowMs = Environment.TickCount64;
+        if (this.audioDeviceController.RecordingDataHasActivity)
+        {
+            this.lastPickupTickMs = nowMs;
+        }
+        var active = nowMs - this.lastPickupTickMs < PickupIndicatorHoldMs;
+        var color = active
+            ? ImGui.ColorConvertFloat4ToU32(new Vector4(0.20f, 0.80f, 0.20f, 1f))
+            : ImGui.ColorConvertFloat4ToU32(new Vector4(0.38f, 0.38f, 0.38f, 1f));
+
+        var radius = ImGui.GetFontSize() * 0.35f;
+        var center = ImGui.GetCursorScreenPos();
+        center.X += radius;
+        center.Y += ImGui.GetTextLineHeight() * 0.5f;
+        ImGui.GetWindowDrawList().AddCircleFilled(center, radius, color);
+        // Reserve layout space so any following SameLine() positions correctly.
+        ImGui.Dummy(new Vector2(radius * 2f + 2f, ImGui.GetTextLineHeight()));
+    }
 }
 

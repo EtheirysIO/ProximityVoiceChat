@@ -41,6 +41,19 @@ public class Configuration : IPluginConfiguration
     public int PushToTalkReleaseDelayMs { get; set; } = 20;
     public bool SuppressNoise { get; set; } = true;
 
+    /// <summary>
+    /// WebRTC VAD operating mode, 0-3. Maps to
+    /// <c>WebRtcVadSharp.OperatingMode</c>:
+    /// 0 = Quality (most sensitive, picks up quieter speech),
+    /// 1 = LowBitrate,
+    /// 2 = Aggressive (default, preserves current behavior),
+    /// 3 = VeryAggressive (least sensitive, rejects more background).
+    /// Only effective when <see cref="SuppressNoise"/> is true; the VAD gate
+    /// at <c>AudioDeviceController.OnAudioSourceDataAvailable</c> is skipped
+    /// when suppression is off.
+    /// </summary>
+    public int VadSensitivity { get; set; } = 2;
+
     public bool MuteMic { get; set; }
     public bool Deafen { get; set; }
 

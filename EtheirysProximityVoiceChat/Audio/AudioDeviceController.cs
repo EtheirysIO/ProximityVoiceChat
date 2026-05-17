@@ -218,6 +218,11 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
         this.audioRecordingDeviceIndex = configuration.SelectedAudioInputDeviceIndex;
         this.audioPlaybackDeviceIndex = configuration.SelectedAudioOutputDeviceIndex;
 
+        // Align the field-initialized VAD instance with the persisted user
+        // preference. The field default (Aggressive) acts as a fallback for
+        // existing configs that don't carry VadSensitivity yet.
+        SetVadOperatingMode(configuration.VadSensitivity);
+
         // This is how buffer size is calculated in WaveOutEvent
         this.maxPlaybackChannelBufferSize = this.waveFormat.ConvertLatencyToByteSize((WaveOutDesiredLatency + WaveOutNumberOfBuffers - 1) / WaveOutNumberOfBuffers) * WaveOutNumberOfBuffers;
 
@@ -246,6 +251,15 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             }
             this.playbackChannels.Clear();
         }
+    }
+
+    public void SetVadOperatingMode(int mode)
+    {
+        // Clamp into WebRtcVadSharp.OperatingMode (Quality=0..VeryAggressive=3).
+        // Any out-of-range value falls back to Aggressive (2) -- the historical
+        // hardcoded default before this setting existed.
+        var clamped = mode is >= 0 and <= 3 ? mode : 2;
+        this.selfVoiceActivityDetector.OperatingMode = (WebRtcVadSharp.OperatingMode)clamped;
     }
 
     public IEnumerable<string> GetAudioRecordingDevices()

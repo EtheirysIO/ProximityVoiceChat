@@ -38,6 +38,12 @@ public interface IAudioDeviceController
     public event EventHandler<WaveInEventArgs>? OnAudioRecordingSourceDataAvailable;
     public bool RecordingDataHasActivity { get; }
 
+    /// <summary>
+    /// Update the WebRTC VAD operating mode on the live self-VAD instance.
+    /// Mode is clamped to [0, 3]; out-of-range values fall back to 2 (Aggressive).
+    /// </summary>
+    void SetVadOperatingMode(int mode);
+
     IEnumerable<string> GetAudioRecordingDevices();
     IEnumerable<string> GetAudioPlaybackDevices();
 

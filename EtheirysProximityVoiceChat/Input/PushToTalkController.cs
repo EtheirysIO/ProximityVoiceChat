@@ -78,6 +78,11 @@ public class PushToTalkController : IAudioDeviceController
     }
     bool IAudioDeviceController.RecordingDataHasActivity => this.baseAudioDeviceController.RecordingDataHasActivity;
 
+    void IAudioDeviceController.SetVadOperatingMode(int mode)
+    {
+        this.baseAudioDeviceController.SetVadOperatingMode(mode);
+    }
+
     public bool PushToTalkKeyDown { get; private set; }
 
     private readonly IAudioDeviceController baseAudioDeviceController;
