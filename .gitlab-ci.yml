@@ -12,7 +12,11 @@
 # Runner requirements (self-hosted):
 #   - Windows, shell executor running PowerShell 5.1+ or PowerShell 7
 #   - .NET 10 SDK on PATH (`dotnet --version` >= 10.0)
-#   - Registered with the tag `windows`
+#   - Registered with the tag `turbotits`
+#
+# Dalamud assemblies are downloaded in-job from the goatcorp dalamud-distrib
+# release channel, so the runner does NOT need XIVLauncher/Dalamud installed
+# locally. Bumping to stg/canary is a one-line change in the build job.
 
 stages:
   - build
@@ -25,7 +29,7 @@ variables:
 build:
   stage: build
   tags:
-    - windows
+    - turbotits
   rules:
     # Tagged release: v1.2.3 / v1.2.3.4 etc.
     - if: '$CI_COMMIT_TAG =~ /^v.+$/'
@@ -62,6 +66,27 @@ build:
       "@
       Set-Content -Path "EtheirysProximityVoiceChat/EmbeddedConfig.cs" -Value $embedded -Encoding UTF8
 
+    # Dalamud.NET.Sdk's targets look for a local Dalamud install under
+    # %APPDATA%\XIVLauncher\addon\Hooks\dev (which doesn't exist on a service-
+    # account runner). Download the public release-channel build of Dalamud and
+    # point DALAMUD_HOME at it so the SDK resolves its assembly references.
+    # Switch to `stg/latest.zip` if/when the plugin needs to target staging.
+    - |
+      $dalamudDir = Join-Path $env:CI_PROJECT_DIR ".dalamud"
+      $dalamudUrl = "https://goatcorp.github.io/dalamud-distrib/latest.zip"
+      if (-not (Test-Path (Join-Path $dalamudDir "Dalamud.dll"))) {
+          Write-Host "Downloading Dalamud from $dalamudUrl"
+          New-Item -ItemType Directory -Force -Path $dalamudDir | Out-Null
+          $zipPath = Join-Path $env:CI_PROJECT_DIR ".dalamud.zip"
+          Invoke-WebRequest -Uri $dalamudUrl -OutFile $zipPath -UseBasicParsing
+          Expand-Archive -Path $zipPath -DestinationPath $dalamudDir -Force
+          Remove-Item $zipPath
+      } else {
+          Write-Host "Reusing cached Dalamud at $dalamudDir"
+      }
+      $env:DALAMUD_HOME = $dalamudDir
+      Write-Host "DALAMUD_HOME=$env:DALAMUD_HOME"
+
     - dotnet restore $env:CSPROJ
     - |
       # MSBuild global properties (-p:Version=) override the <Version> in the
@@ -83,7 +108,7 @@ build:
 release:
   stage: release
   tags:
-    - windows
+    - turbotits
   rules:
     - if: '$CI_COMMIT_TAG =~ /^v.+$/'
   needs:
