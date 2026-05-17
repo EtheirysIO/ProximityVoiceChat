@@ -1,30 +1,46 @@
 # Etheirys Proximity Voice Chat -- GitLab CI/CD
 #
-# Tag push (vX.Y.Z[.W]) builds the plugin with the tag's version stamped in
-# and publishes a GitLab Release with latest.zip + manifest attached. Manual
-# pipelines (Pipelines -> Run pipeline) build at the version embedded in
-# EtheirysProximityVoiceChat.csproj -- artifacts only, no Release created.
+# Triggered by tag pushes (vX.Y.Z[.W]). At pipeline runtime the build job
+# determines which release channel the tag belongs to by checking branch
+# ancestry of the tagged commit:
+#   * Reachable from master  -> "latest"  channel, produces latest.zip
+#   * Reachable from testing -> "testing" channel, produces testing.zip
+# Master is checked first, so a commit that ended up on both becomes latest.
+# A tag on a commit that isn't on either branch fails the build loudly.
 #
-# Required CI/CD variables (Settings -> CI/CD -> Variables, both Masked):
-#   SIGNALING_SERVER_URL    e.g. https://signaling.example.com
-#   SIGNALING_SERVER_TOKEN  the bearer token baked into EmbeddedConfig.cs
+# Manual pipelines from the Pipelines page still build (useful for smoke
+# tests) but the deploy job is skipped since there is no channel to publish to.
+#
+# Required CI/CD variables (Settings -> CI/CD -> Variables, all Masked):
+#   SIGNALING_SERVER_URL    URL baked into EmbeddedConfig.cs
+#   SIGNALING_SERVER_TOKEN  token baked into EmbeddedConfig.cs
+#   REPO_TOKEN              bearer token for both upload endpoints
+#   REPO_LATEST             full upload URL for the latest channel
+#                           e.g. https://repo.etheirys.io/api/ci/plugin/etheirys-proximity-voice-chat/upload/latest
+#   REPO_TESTING            full upload URL for the testing channel
+#                           e.g. https://repo.etheirys.io/api/ci/plugin/etheirys-proximity-voice-chat/upload/testing
 #
 # Runner requirements (self-hosted):
 #   - Windows, shell executor running PowerShell 5.1+ or PowerShell 7
-#   - .NET 10 SDK on PATH (`dotnet --version` >= 10.0)
+#   - .NET 10 SDK on PATH
+#   - curl.exe on PATH (ships with Windows 10+)
 #   - Registered with the tag `turbotits`
 #
 # Dalamud assemblies are downloaded in-job from the goatcorp dalamud-distrib
-# release channel, so the runner does NOT need XIVLauncher/Dalamud installed
-# locally. Bumping to stg/canary is a one-line change in the build job.
+# release channel, so the runner does NOT need XIVLauncher/Dalamud installed.
+# Switch to stg/canary in the build job if needed.
 
 stages:
   - build
-  - release
+  - deploy
 
 variables:
   CSPROJ: EtheirysProximityVoiceChat/EtheirysProximityVoiceChat.csproj
   ARTIFACT_DIR: EtheirysProximityVoiceChat/bin/Release/EtheirysProximityVoiceChat
+  # Full clone so we can run `git merge-base --is-ancestor` against master and
+  # testing. Shallow clones default to depth=20 which is unreliable for tags on
+  # older commits.
+  GIT_DEPTH: "0"
 
 build:
   stage: build
@@ -33,12 +49,12 @@ build:
   rules:
     # Tagged release: v1.2.3 / v1.2.3.4 etc.
     - if: '$CI_COMMIT_TAG =~ /^v.+$/'
-    # Manual run from the Pipelines page -- no tag, falls back to csproj version
+    # Manual run from the Pipelines page -- builds but doesn't deploy
     - if: '$CI_PIPELINE_SOURCE == "web"'
   script:
-    # Pick the version: strip the leading 'v' from the tag, or leave unset so
-    # MSBuild falls back to the <Version> declared in the csproj.
     - |
+      # Pick the version: strip the leading 'v' from the tag, or leave unset so
+      # MSBuild falls back to the <Version> declared in the csproj.
       if ($env:CI_COMMIT_TAG -match '^v(.+)$') {
           $script:PluginVersion = $Matches[1]
           Write-Host "Building tagged release: $script:PluginVersion"
@@ -47,9 +63,41 @@ build:
           Write-Host "No tag -- using version embedded in csproj"
       }
 
-    # EmbeddedConfig.cs is gitignored. Stamp it in from masked CI variables so
-    # the released DLL carries the maintainer's live signaling URL + token.
     - |
+      # Channel detection. Fetch master + testing if they exist on the remote,
+      # then walk ancestry from the tagged commit. Master wins ties.
+      git fetch --no-tags origin master:refs/remotes/origin/master 2>$null
+      git fetch --no-tags origin testing:refs/remotes/origin/testing 2>$null
+
+      git rev-parse --verify --quiet refs/remotes/origin/master *> $null
+      $hasMaster = ($LASTEXITCODE -eq 0)
+      git rev-parse --verify --quiet refs/remotes/origin/testing *> $null
+      $hasTesting = ($LASTEXITCODE -eq 0)
+
+      $channel = $null
+      if ($hasMaster) {
+          git merge-base --is-ancestor HEAD refs/remotes/origin/master *> $null
+          if ($LASTEXITCODE -eq 0) { $channel = "latest" }
+      }
+      if (-not $channel -and $hasTesting) {
+          git merge-base --is-ancestor HEAD refs/remotes/origin/testing *> $null
+          if ($LASTEXITCODE -eq 0) { $channel = "testing" }
+      }
+
+      if (-not $channel) {
+          if ($env:CI_PIPELINE_SOURCE -eq "web") {
+              Write-Host "Manual web pipeline -- no channel, deploy will be skipped"
+              $channel = "none"
+          } else {
+              Write-Host "##[error]Tag '$env:CI_COMMIT_TAG' is not reachable from master or testing"
+              exit 1
+          }
+      }
+      $script:Channel = $channel
+      Write-Host "Channel: $script:Channel"
+
+    - |
+      # EmbeddedConfig.cs is gitignored. Stamp it in from masked CI variables.
       if (-not $env:SIGNALING_SERVER_URL -or -not $env:SIGNALING_SERVER_TOKEN) {
           Write-Host "##[error]SIGNALING_SERVER_URL and SIGNALING_SERVER_TOKEN must both be set as masked CI/CD variables"
           exit 1
@@ -66,12 +114,9 @@ build:
       "@
       Set-Content -Path "EtheirysProximityVoiceChat/EmbeddedConfig.cs" -Value $embedded -Encoding UTF8
 
-    # Dalamud.NET.Sdk's targets look for a local Dalamud install under
-    # %APPDATA%\XIVLauncher\addon\Hooks\dev (which doesn't exist on a service-
-    # account runner). Download the public release-channel build of Dalamud and
-    # point DALAMUD_HOME at it so the SDK resolves its assembly references.
-    # Switch to `stg/latest.zip` if/when the plugin needs to target staging.
     - |
+      # Dalamud.NET.Sdk needs DALAMUD_HOME or a local XIVLauncher install. The
+      # runner runs as LocalSystem, so we provide Dalamud ourselves.
       $dalamudDir = Join-Path $env:CI_PROJECT_DIR ".dalamud"
       $dalamudUrl = "https://goatcorp.github.io/dalamud-distrib/latest.zip"
       if (-not (Test-Path (Join-Path $dalamudDir "Dalamud.dll"))) {
@@ -89,66 +134,95 @@ build:
 
     - dotnet restore $env:CSPROJ
     - |
-      # MSBuild global properties (-p:Version=) override the <Version> in the
-      # csproj. When PluginVersion is null we omit the flag entirely so the
-      # csproj value wins.
       if ($script:PluginVersion) {
           dotnet build $env:CSPROJ -c Release --no-restore -p:Version=$script:PluginVersion
       } else {
           dotnet build $env:CSPROJ -c Release --no-restore
       }
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    - |
+      # Stage the build output under dist/ with the channel-specific name and
+      # pass the channel to the deploy job via a dotenv artifact.
+      $dist = Join-Path $env:CI_PROJECT_DIR "dist"
+      New-Item -ItemType Directory -Force -Path $dist | Out-Null
+      $sourceZip = Join-Path $env:ARTIFACT_DIR "latest.zip"
+      if (-not (Test-Path $sourceZip)) {
+          Write-Host "##[error]Build output not found at $sourceZip"
+          exit 1
+      }
+
+      $outName = switch ($script:Channel) {
+          "latest"  { "latest.zip" }
+          "testing" { "testing.zip" }
+          default   { "latest.zip" }  # web pipeline -- keep canonical name
+      }
+      Copy-Item -Force $sourceZip (Join-Path $dist $outName)
+
+      # CHANNEL is consumed by the deploy job via the dotenv report below.
+      "CHANNEL=$($script:Channel)" | Out-File -FilePath build.env -Encoding ASCII
+      Write-Host "Staged dist/${outName} for channel '$($script:Channel)'"
   artifacts:
     name: "EtheirysProximityVoiceChat-$CI_COMMIT_REF_SLUG"
     paths:
-      - $ARTIFACT_DIR/latest.zip
-      - $ARTIFACT_DIR/EtheirysProximityVoiceChat.json
+      - dist/
+    reports:
+      dotenv: build.env
     expire_in: 1 year
 
-release:
-  stage: release
+deploy:
+  stage: deploy
   tags:
     - turbotits
   rules:
+    # Tag-only -- web pipelines do not deploy.
     - if: '$CI_COMMIT_TAG =~ /^v.+$/'
   needs:
     - job: build
       artifacts: true
   script:
-    # Create the GitLab Release via the REST API. CI_JOB_TOKEN is auto-injected
-    # and has permission to create releases on the current project. This avoids
-    # requiring release-cli or any extra tooling on the Windows runner.
-    #
-    # Asset URLs use the latest-successful-artifact form
-    # (`/-/jobs/artifacts/<ref>/raw/<path>?job=<job_name>`), so we don't need to
-    # plumb the build job's CI_JOB_ID through to this job.
+    # CHANNEL comes from the build job's dotenv artifact. Pick the matching URL
+    # (both channels share REPO_TOKEN) and POST the zip via curl multipart form
+    # upload. We invoke curl.exe explicitly because PowerShell aliases `curl`
+    # to Invoke-WebRequest with incompatible flags.
     - |
-      $assetBase = "$env:CI_PROJECT_URL/-/jobs/artifacts/$env:CI_COMMIT_TAG/raw"
-      $zipUrl    = "$assetBase/$env:ARTIFACT_DIR/latest.zip?job=build"
-      $jsonUrl   = "$assetBase/$env:ARTIFACT_DIR/EtheirysProximityVoiceChat.json?job=build"
-
-      $body = @{
-          name        = "$env:CI_COMMIT_TAG"
-          tag_name    = "$env:CI_COMMIT_TAG"
-          description = "Automated release for ``$env:CI_COMMIT_TAG``."
-          assets      = @{
-              links = @(
-                  @{ name = "latest.zip";                       url = $zipUrl;  link_type = "package" }
-                  @{ name = "EtheirysProximityVoiceChat.json";  url = $jsonUrl; link_type = "other"   }
-              )
-          }
-      } | ConvertTo-Json -Depth 5
-
-      $headers = @{
-          "JOB-TOKEN"    = $env:CI_JOB_TOKEN
-          "Content-Type" = "application/json"
+      if (-not $env:REPO_TOKEN) {
+          Write-Host "##[error]REPO_TOKEN must be set as a masked CI/CD variable"
+          exit 1
       }
 
-      Write-Host "POST $env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/releases"
-      Invoke-RestMethod `
-          -Method Post `
-          -Uri "$env:CI_API_V4_URL/projects/$env:CI_PROJECT_ID/releases" `
-          -Headers $headers `
-          -Body $body | Out-Null
+      switch ($env:CHANNEL) {
+          "latest" {
+              if (-not $env:REPO_LATEST) {
+                  Write-Host "##[error]REPO_LATEST must be set"
+                  exit 1
+              }
+              $zip = "dist/latest.zip"
+              $url = $env:REPO_LATEST
+          }
+          "testing" {
+              if (-not $env:REPO_TESTING) {
+                  Write-Host "##[error]REPO_TESTING must be set"
+                  exit 1
+              }
+              $zip = "dist/testing.zip"
+              $url = $env:REPO_TESTING
+          }
+          default {
+              Write-Host "##[error]CHANNEL='$env:CHANNEL' (expected 'latest' or 'testing'). Did the build job set the dotenv report?"
+              exit 1
+          }
+      }
 
-      Write-Host "Release $env:CI_COMMIT_TAG created."
+      if (-not (Test-Path $zip)) {
+          Write-Host "##[error]Build artifact not found at $zip"
+          exit 1
+      }
+
+      Write-Host "Uploading $zip to '$env:CHANNEL' channel"
+      curl.exe -fsS -H "Authorization: Bearer $env:REPO_TOKEN" -F "plugin=@$zip" "$url"
+      if ($LASTEXITCODE -ne 0) {
+          Write-Host "##[error]curl exited with code $LASTEXITCODE"
+          exit $LASTEXITCODE
+      }
+      Write-Host "Deploy complete."
