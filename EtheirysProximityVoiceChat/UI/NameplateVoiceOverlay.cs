@@ -87,8 +87,11 @@ public sealed class NameplateVoiceOverlay(
     private readonly Dictionary<string, Vector2> nameplateScreenPosByPlayer = new(StringComparer.Ordinal);
 
     // Pixels above the top of the nameplate's NameContainer where the icon
-    // center is drawn. Positive values move the icon further above the name.
-    private const float IconYOffsetAboveNameplatePx = 8f;
+    // bottom is drawn. Positive values place the icon ABOVE the name;
+    // negative values move it down so it sits at name-line level. Tuned
+    // to -50f after user feedback that the icon was floating too high
+    // above the nameplate.
+    private const float IconYOffsetAboveNameplatePx = -50f;
     // The microphone glyph is roughly square at iconFontSize; this is its
     // approximate half-width for centering. (No font metrics API in ImGui
     // unless we push the icon font first; this approximation is good enough.)

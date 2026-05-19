@@ -19,6 +19,7 @@ using EtheirysProximityVoiceChat.Log;
 using EtheirysProximityVoiceChat.UI.View;
 using Reactive.Bindings;
 using System;
+using System.Reactive.Linq;
 using WindowsInput.Events;
 
 namespace EtheirysProximityVoiceChat.UI.Presenter;
@@ -197,7 +198,24 @@ public class ConfigWindowPresenter(
         {
             reactiveProperty.Value = initialValue;
         }
-        reactiveProperty.Subscribe(dataUpdateAction);
+        // ReactiveProperty emits the current value immediately on subscribe.
+        // Skipping that first emission avoids an eager config save during
+        // plugin startup that races Dalamud's storage layer and intermittently
+        // surfaces as "database is locked". Wrap the user-supplied action in
+        // try/catch so a single bad write can't tear down the subscription.
+        reactiveProperty
+            .Skip(1)
+            .Subscribe(value =>
+            {
+                try
+                {
+                    dataUpdateAction(value);
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error("Failed to persist config update: {0}", ex);
+                }
+            });
     }
 
     private void OnInputKeyDown(KeyDown k)

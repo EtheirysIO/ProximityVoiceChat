@@ -361,6 +361,31 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         var rosterMaterialized = inRoom
             ? this.voiceRoomManager.PlayersInVoiceRoom.ToList()
             : new List<string>();
+
+        // Sort the roster by spatial distance so the closest peers (the
+        // ones you can actually hear) bubble to the top. Self stays at
+        // position 0 unconditionally; everyone else is grouped into
+        // "in-range, sorted by distance ascending" followed by
+        // "out-of-range (NaN distance), preserving roster order".
+        // Stable on ties via the original-index tiebreaker.
+        if (inRoom && rosterMaterialized.Count > 1)
+        {
+            var selfUser = rosterMaterialized[0];
+            rosterMaterialized = rosterMaterialized
+                .Skip(1)
+                .Select((user, originalIndex) => new
+                {
+                    user,
+                    originalIndex,
+                    distance = GetTrackedPlayerDistance(user),
+                })
+                .OrderBy(entry => float.IsNaN(entry.distance) ? 1 : 0)
+                .ThenBy(entry => float.IsNaN(entry.distance) ? float.MaxValue : entry.distance)
+                .ThenBy(entry => entry.originalIndex)
+                .Select(entry => entry.user)
+                .Prepend(selfUser)
+                .ToList();
+        }
         int count = rosterMaterialized.Count;
 
         if (inRoom)
@@ -452,8 +477,25 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                         break;
                     }
                     default:
-                        ImGui.Text("  Unknown error (see /xllog)");
+                    {
+                        // Fall back to the server-supplied error string when the
+                        // error code doesn't match one of the cases above.
+                        // LatestErrorMessage is populated by SignalingChannel's
+                        // OnServerDisconnect handler from the structured
+                        // serverDisconnect payload, so we surface the actual
+                        // reason (e.g. "Server is shutting down (SIGTERM)")
+                        // instead of the unhelpful "Unknown error" boilerplate.
+                        var latestErrorMessage = this.voiceRoomManager.SignalingChannel?.LatestErrorMessage;
+                        if (!string.IsNullOrWhiteSpace(latestErrorMessage))
+                        {
+                            ImGui.TextWrapped($"  {latestErrorMessage}");
+                        }
+                        else
+                        {
+                            ImGui.Text("  Unknown error");
+                        }
                         break;
+                    }
                 }
             }
         }
@@ -473,6 +515,12 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         var distance = !isSelf && this.voiceRoomManager.TrackedPlayers.TryGetValue(user, out var tp)
             ? tp.Distance
             : float.NaN;
+        // NaN distance for a non-self peer means the Spatializer can't see
+        // them (different map / instance / out-of-stream-range). Renders
+        // their roster row in muted gray with an explanatory tooltip so
+        // users understand "I can see them in the room but I can't hear
+        // them right now".
+        var outOfRange = !isSelf && float.IsNaN(distance);
 
         // Speaking state: local mic for self, per-channel relay activity for peers.
         var isSpeaking = isSelf
@@ -535,12 +583,25 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         var distStr = !isSelf && !float.IsNaN(distance) ? $" ({distance:F1}y)" : string.Empty;
         var fullLabel = $"{rawName}{distStr}";
 
-        ImGui.TextColored(profileColor, fullLabel);
+        // Out-of-range peers render in muted gray so they read visually as
+        // "present but inaudible". Everyone else gets their normal profile
+        // color (white for non-premium peers — see GetProfileForUser).
+        var labelColor = outOfRange
+            ? new Vector4(0.78f, 0.78f, 0.78f, 1f)
+            : profileColor;
+        ImGui.TextColored(labelColor, fullLabel);
+        if (outOfRange)
+        {
+            if (ImGui.IsItemHovered())
+            {
+                ImGui.SetTooltip("Player out of range, and cannot be heard");
+            }
+        }
         // ShowProfileFeature is a compile-time const false (see ConfigWindow.cs
         // for the rationale) → the if-body folds away. Suppress CS0162 so the
         // feature-flag intent stays visible in source.
 #pragma warning disable CS0162
-        if (ShowProfileFeature)
+        else if (ShowProfileFeature)
         {
             if (ImGui.IsItemHovered())
             {
@@ -793,6 +854,20 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     }
 
     /// <summary>
+    /// Helper for the roster sort + out-of-range visual: looks up a peer's
+    /// current <see cref="TrackedPlayer.Distance"/>, returns NaN when the
+    /// Spatializer hasn't computed one (peer in a different map / instance /
+    /// out-of-stream-range). DrawVoiceChannel uses NaN to sink the peer to
+    /// the bottom of the list; DrawPeerRow uses it to render the row gray.
+    /// </summary>
+    private float GetTrackedPlayerDistance(string user)
+    {
+        return this.voiceRoomManager.TrackedPlayers.TryGetValue(user, out var tracked)
+            ? tracked.Distance
+            : float.NaN;
+    }
+
+    /// <summary>
     /// Returns the brightness (0..1) for the per-peer voice-activity dot.
     /// 0 means "don't draw it at all" — used for silence and for peers past
     /// <see cref="Configuration.FalloffModel"/>'s <c>MaximumDistance</c>.
@@ -931,7 +1006,17 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     private void DrawKickedByAdminModal()
     {
         ImGui.SetNextWindowSize(new Vector2(380f, 0f), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal("You have been kicked##kicked-by-admin-modal", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoResize))
+        // NoTitleBar: removes ImGui's automatic title bar entirely so the
+        // modal can never display the popup ID as its title under any
+        // circumstance — the "Visible##internal-id" split-label form is
+        // correct ImGui syntax (the same pattern the rest of this file
+        // uses for Leave##voice / Retry##mic-retry / etc.), but a stale
+        // cached build with the old single-string label would show
+        // "kicked-by-admin-modal" verbatim in the title bar. Belt-and-
+        // suspenders: kill the title bar instead. The red
+        // "Kicked from voice chat" text inside the modal body now serves
+        // as the visible heading; the user dismisses via the OK button.
+        if (ImGui.BeginPopupModal("You have been kicked##kicked-by-admin-modal", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoResize | ImGuiWindowFlags.NoTitleBar))
         {
             ImGui.TextColored(new Vector4(0.95f, 0.45f, 0.45f, 1f), "Kicked from voice chat");
             ImGui.Spacing();
