@@ -162,7 +162,7 @@ public class ConfigWindowPresenter(
             this.audioDeviceController.AudioPlaybackDeviceIndex = -1;
 
             this.view.SuppressNoise.Value = true;
-            this.view.VadSensitivity.Value = 2;
+            this.view.VadSensitivity.Value = 3;
             this.view.PushToTalk.Value = false;
             this.view.InputBoost.Value = 1.0f;
 

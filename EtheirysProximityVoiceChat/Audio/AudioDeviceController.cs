@@ -181,12 +181,15 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
     /// </summary>
     private const int PerPeerJitterBufferTargetMs = PerPeerJitterBufferTargetTcpMs;
     /// <summary>
-    /// Number of consecutive non-speech frames the VAD must see after speech ends
-    /// before we mute outgoing audio. At 20 ms/frame, 15 frames = 300 ms — long
-    /// enough to preserve the tail of the last word but short enough to actually
-    /// suppress background room noise between utterances.
+    /// Number of consecutive non-speech frames the VAD must see after speech
+    /// ends before we mute outgoing audio. At 20 ms/frame, 8 frames = 160 ms
+    /// — still preserves the tail of trailing consonants ("s", "t", "f"
+    /// decay within ~100–150 ms) but cuts the post-speech window in half so
+    /// keyboard / mouse / room noise that triggers VAD just after a real
+    /// utterance gets gated off much faster. Reduced from 15 (300 ms) after
+    /// user reports of typing leaking through between words.
     /// </summary>
-    private const int SpeechHangoverFrames = 15;
+    private const int SpeechHangoverFrames = 8;
 
     private readonly DalamudServices dalamud;
     private readonly Configuration configuration;
