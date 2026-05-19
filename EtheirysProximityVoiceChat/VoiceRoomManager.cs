@@ -40,6 +40,44 @@ public sealed class VoiceRoomManager : IDisposable
 
     public bool InRoom { get; private set; }
 
+    /// <summary>
+    /// v4 only. Latest <c>roomMeta</c> snapshot pushed by the server. Null
+    /// when not in a private room, when the server hasn't yet pushed a
+    /// snapshot (the server only emits these to room authorities — owner +
+    /// mods — so non-authority joiners never receive one), or after a
+    /// disconnect. Read by <c>MainWindow</c> to decide which moderation
+    /// controls to render in the per-peer right-click menu.
+    /// </summary>
+    public WebRTC.SignalingChannel.RoomMetaSnapshot? CurrentRoomMeta { get; private set; }
+
+    /// <summary>
+    /// Convenience: true when the local player is the owner or a moderator
+    /// of the current room (per the latest <see cref="CurrentRoomMeta"/>).
+    /// </summary>
+    public bool IsLocalRoomAuthority
+    {
+        get
+        {
+            var meta = this.CurrentRoomMeta;
+            if (meta == null || string.IsNullOrEmpty(this.localPlayerFullName)) return false;
+            if (meta.Value.OwnerPeerId == this.localPlayerFullName) return true;
+            var mods = meta.Value.Moderators;
+            return mods != null && mods.Contains(this.localPlayerFullName);
+        }
+    }
+
+    /// <summary>True when the local player is the owner of the current room.</summary>
+    public bool IsLocalRoomOwner
+    {
+        get
+        {
+            var meta = this.CurrentRoomMeta;
+            return meta != null
+                && !string.IsNullOrEmpty(this.localPlayerFullName)
+                && meta.Value.OwnerPeerId == this.localPlayerFullName;
+        }
+    }
+
     public bool InPublicRoom
     {
         get
@@ -128,6 +166,12 @@ public sealed class VoiceRoomManager : IDisposable
     private string? lastRoomName;
     private string? lastRoomPassword;
     private string[]? lastPlayersInInstance;
+    // v4 private-room metadata cached for replay by the auto-reconnect loop.
+    // Both default to "public-mode-safe" values (listed=true is meaningless
+    // for public, currentWorld=null means "server, don't try to interpret
+    // this as a v4 private room").
+    private bool lastListed = true;
+    private string? lastCurrentWorld;
 
     /// <summary>True while a reconnect retry loop is in flight.</summary>
     public bool IsReconnecting { get; private set; }
@@ -387,7 +431,7 @@ public sealed class VoiceRoomManager : IDisposable
         this.mapManager.OnMapChanged += ReconnectToCurrentMapPublicRoom;
     }
 
-    public void JoinPrivateVoiceRoom(string roomName, string roomPassword)
+    public void JoinPrivateVoiceRoom(string roomName, string roomPassword, bool listed = true, string? currentWorld = null)
     {
         if (this.ShouldBeInRoom)
         {
@@ -395,6 +439,12 @@ public sealed class VoiceRoomManager : IDisposable
             return;
         }
         this.currentSessionIsPublic = false;
+        // v4: cache the listed/world parts of the join params so the retry
+        // loop replays them. lastListed / lastCurrentWorld pair with the
+        // lastRoomName / lastRoomPassword fields already cached in
+        // JoinVoiceRoom below.
+        this.lastListed = listed;
+        this.lastCurrentWorld = currentWorld;
         JoinVoiceRoom(roomName, roomPassword, null);
     }
 
@@ -430,6 +480,7 @@ public sealed class VoiceRoomManager : IDisposable
         // room doesn't leak into the next one.
         this.GloballyMutedPeers.Clear();
         this.configuration.IsLocallyGlobalMuted = false;
+        this.CurrentRoomMeta = null;
 
         this.audioDeviceController.AudioRecordingIsRequested = false;
         this.audioDeviceController.OnAudioRecordingSourceDataAvailable -= SendAudioFrameToServer;
@@ -486,6 +537,7 @@ public sealed class VoiceRoomManager : IDisposable
             this.SignalingChannel.OnPremiumStatus -= OnPremiumStatusReceived;
             this.SignalingChannel.OnAdminStatus -= OnAdminStatusReceived;
             this.SignalingChannel.OnMuteState -= OnMuteStateReceived;
+            this.SignalingChannel.OnRoomMeta -= OnRoomMetaReceived;
             return this.SignalingChannel.DisconnectAsync();
         }
         else
@@ -604,11 +656,17 @@ public sealed class VoiceRoomManager : IDisposable
         this.SignalingChannel.OnPremiumStatus += OnPremiumStatusReceived;
         this.SignalingChannel.OnAdminStatus += OnAdminStatusReceived;
         this.SignalingChannel.OnMuteState += OnMuteStateReceived;
+        this.SignalingChannel.OnRoomMeta += OnRoomMetaReceived;
         this.Presence.OnPeerAdded += OnPeerAdded;
         this.Presence.OnPeerRemoved += OnPeerRemoved;
 
         this.logger.Debug("Attempting to connect to signaling channel.");
-        this.SignalingChannel.ConnectAsync(roomName, roomPassword, playersInInstance).SafeFireAndForget(ex =>
+        this.SignalingChannel.ConnectAsync(
+            roomName,
+            roomPassword,
+            playersInInstance,
+            this.lastListed,
+            this.lastCurrentWorld).SafeFireAndForget(ex =>
         {
             if (ex is not OperationCanceledException)
             {
@@ -788,6 +846,17 @@ public sealed class VoiceRoomManager : IDisposable
         // persist this. Just mirror into the runtime cache so MainWindow's
         // right-click menu knows whether to render the admin items.
         this.configuration.IsLocalAdmin = isAdmin;
+    }
+
+    /// <summary>
+    /// v4 only. Cache the latest <c>roomMeta</c> snapshot pushed by the
+    /// server. The server pushes these only to room authorities (owner +
+    /// mods); non-authority peers never see one. Consumers
+    /// (<c>MainWindow</c>) read <see cref="CurrentRoomMeta"/> each frame.
+    /// </summary>
+    private void OnRoomMetaReceived(WebRTC.SignalingChannel.RoomMetaSnapshot snapshot)
+    {
+        this.CurrentRoomMeta = snapshot;
     }
 
     private void OnMuteStateReceived(string peerId, bool muted, bool isSelf)
