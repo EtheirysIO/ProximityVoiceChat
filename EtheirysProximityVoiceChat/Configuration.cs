@@ -37,6 +37,32 @@ public class Configuration : IPluginConfiguration
 
     public int SelectedAudioInputDeviceIndex { get; set; } = -1;
     public int SelectedAudioOutputDeviceIndex { get; set; } = -1;
+
+    /// <summary>
+    /// v3+ only. When true (default), clients attempt to establish a UDP
+    /// audio channel for low-latency / loss-tolerant transport; on failure
+    /// they fall back to the Socket.IO TCP path. Set to false to force the
+    /// TCP path globally — useful for users behind restrictive firewalls
+    /// who don't want the ~5 s hello-ack timeout on every session, or for
+    /// debugging.
+    /// </summary>
+    public bool PreferUdpAudio { get; set; } = true;
+
+    /// <summary>
+    /// Stable WASAPI <c>MMDevice.ID</c> string for the currently selected mic
+    /// (e.g. <c>{0.0.1.00000000}.{c1e3...}</c>). Replaces the fragile WinMM
+    /// integer index (<see cref="SelectedAudioInputDeviceIndex"/>) which
+    /// shifted when USB devices were plugged/unplugged across reboots.
+    ///
+    /// Empty means "use the system default capture device". On first load
+    /// after an upgrade, <see cref="Audio.AudioDeviceController"/> migrates
+    /// the old index → WASAPI ID by friendly-name match (see
+    /// <c>MigrateLegacyRecordingDeviceIndex</c>). The legacy
+    /// <see cref="SelectedAudioInputDeviceIndex"/> field is kept for one
+    /// release so users coming from an older build don't lose their device
+    /// selection; it can be removed afterwards.
+    /// </summary>
+    public string SelectedAudioInputDeviceWasapiId { get; set; } = string.Empty;
     public bool PushToTalk { get; set; }
     public int PushToTalkReleaseDelayMs { get; set; } = 20;
     public bool SuppressNoise { get; set; } = true;
@@ -71,6 +97,16 @@ public class Configuration : IPluginConfiguration
     public KeyBinding DeafenBinding { get; set; } = new();
 
     public float MasterVolume { get; set; } = 2.0f;
+
+    /// <summary>
+    /// Multiplicative gain applied to the captured mic signal before it
+    /// enters the RNNoise denoiser / WebRTC VAD / Opus encoder. 1.0 = no
+    /// change (the bit-for-bit signal the OS delivered); &gt; 1.0 boosts
+    /// quiet mics. Samples are clamped to the int16 range after gain so
+    /// extreme settings clip rather than wrap, and the ConfigWindow flashes
+    /// the input-level meter red when that happens so the user notices.
+    /// </summary>
+    public float InputBoost { get; set; } = 1.0f;
 
     public AudioFalloffModel FalloffModel { get; set; } = new();
     public bool MuteDeadPlayers { get; set; } = true;
@@ -188,6 +224,45 @@ public class Configuration : IPluginConfiguration
     /// </summary>
     [NonSerialized]
     public bool IsLocallyGlobalMuted = false;
+
+    // ─ Resume After Plugin Reload ────────────────────────────────────────
+    // Lets a hot-reload of the plugin (e.g. an in-place update from XIVLauncher)
+    // pick the user's voice session back up without them having to click Join
+    // again. Bounded by a process fingerprint so a full game restart does NOT
+    // resume — that case should always start from a clean slate.
+    //
+    // Written in VoiceRoomManager.Dispose() when ShouldBeInRoom is true, read
+    // (and immediately cleared) in VoiceRoomManager's constructor on the next
+    // plugin load. Clearing on read means a password never lingers on disk
+    // longer than one plugin lifecycle.
+
+    /// <summary>
+    /// "" = no pending resume, "public" / "private" = resume the matching kind
+    /// of room on the next plugin load if the process fingerprint matches.
+    /// </summary>
+    public string ResumeRoomKind { get; set; } = string.Empty;
+
+    /// <summary>Resume target for a private-room session. Unused for public.</summary>
+    public string ResumeRoomName { get; set; } = string.Empty;
+
+    /// <summary>Resume password for a private-room session. Unused for public.</summary>
+    public string ResumeRoomPassword { get; set; } = string.Empty;
+
+    /// <summary>
+    /// OS process id at the time the resume state was written. Compared
+    /// against <see cref="System.Environment.ProcessId"/> on the next plugin
+    /// load — a mismatch means the game itself was restarted, so the resume
+    /// is skipped. PIDs can be recycled across reboots, so this is paired
+    /// with <see cref="ResumeProcessStartTimeTicks"/> for a stronger match.
+    /// </summary>
+    public long ResumeProcessId { get; set; }
+
+    /// <summary>
+    /// <c>Process.StartTime.ToUniversalTime().Ticks</c> at the time the
+    /// resume state was written. Pairs with <see cref="ResumeProcessId"/>
+    /// to defeat PID recycling.
+    /// </summary>
+    public long ResumeProcessStartTimeTicks { get; set; }
 
     public Dictionary<string, float> PeerVolumes { get; set; } = [];
 

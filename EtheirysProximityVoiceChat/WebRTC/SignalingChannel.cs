@@ -29,11 +29,20 @@ namespace EtheirysProximityVoiceChat.WebRTC;
 public sealed class SignalingChannel : IDisposable
 {
     /// <summary>
-    /// Wire-protocol version. Bumped to 2 when audio moved from WebRTC DataChannels
-    /// onto a server-relayed Socket.IO "audio" event. Old (v1) clients are rejected
-    /// at the handshake by the signaling server.
+    /// Wire-protocol version. History:
+    ///   • v1: mesh-WebRTC PCM DataChannels (legacy, no longer supported by server).
+    ///   • v2: Socket.IO server-relayed Opus over WebSocket (= TCP). All audio on the
+    ///         signaling channel itself.
+    ///   • v3: signaling stays on Socket.IO/WSS but audio moves to a parallel UDP
+    ///         datagram channel with AES-128-GCM AEAD. Server issues per-session
+    ///         credentials via the <c>udpCredentials</c> event right after a
+    ///         successful <c>ready</c>. v3 clients keep the Socket.IO <c>audio</c>
+    ///         subscription as a TCP fallback for the cases where UDP can't be
+    ///         established (corporate firewall, restrictive ISP, NAT failure).
+    /// The server accepts both v2 and v3 clients in the same room; it cross-
+    /// stitches the fan-out so a v2 peer hears a v3 peer and vice versa.
     /// </summary>
-    public const string ProtocolVersion = "2";
+    public const string ProtocolVersion = "3";
 
     // Since Dalamud 12, for some reason accessing socket parameters such as socket.Connected from the UI thread
     // would crash the game. So, intermediate field booleans are now used to indicate state to the UI.
@@ -84,6 +93,20 @@ public sealed class SignalingChannel : IDisposable
     /// Fires when a server-relayed audio frame arrives. Args: (sender peerId, Opus packet bytes).
     /// </summary>
     public event Action<string, byte[]>? OnAudioFrame;
+
+    /// <summary>
+    /// Fires when the server sends us our UDP audio-session credentials —
+    /// always immediately after the post-<c>ready</c> roster broadcast, on
+    /// every connection. Only emitted for v3+ clients. The subscriber should
+    /// construct a <c>UdpAudioChannel</c> with the supplied credentials and
+    /// attempt the UDP hello-handshake; on success, audio routes over UDP;
+    /// on failure, the existing Socket.IO <see cref="OnAudioFrame"/> path
+    /// is the fallback.
+    /// Internal because <c>UdpCredentials</c> is internal — only consumers
+    /// inside the plugin assembly need it.
+    /// </summary>
+    internal event Action<UdpCredentials>? OnUdpCredentialsReceived;
+
     public event Action? OnDisconnected;
     public event Action? OnErrored;
 
@@ -274,6 +297,7 @@ public sealed class SignalingChannel : IDisposable
         this.OnMuteState = null;
         this.OnMessage = null;
         this.OnAudioFrame = null;
+        this.OnUdpCredentialsReceived = null;
         this.OnDisconnected = null;
         this.OnLatencyUpdated = null;
         this.DisposeSocket();
@@ -294,6 +318,7 @@ public sealed class SignalingChannel : IDisposable
             this.socket.On("premiumStatus", this.OnPremiumStatusCallback);
             this.socket.On("adminStatus", this.OnAdminStatusCallback);
             this.socket.On("muteState", this.OnMuteStateCallback);
+            this.socket.On("udpCredentials", this.OnUdpCredentialsCallback);
         }
     }
 
@@ -312,9 +337,67 @@ public sealed class SignalingChannel : IDisposable
             this.socket.Off("premiumStatus");
             this.socket.Off("adminStatus");
             this.socket.Off("muteState");
+            this.socket.Off("udpCredentials");
             this.socket.Dispose();
         }
         this.socket = null;
+    }
+
+    /// <summary>
+    /// Variant of <see cref="DisposeSocket"/> safe to call from inside one of
+    /// the library's own event callbacks (<c>OnDisconnect</c>, <c>OnError</c>,
+    /// or a server-side message handler like <c>serverDisconnect</c>).
+    /// SocketIOClient's internal <c>InvokeDisconnect</c>/<c>InvokeError</c>
+    /// continues to touch its own <see cref="CancellationTokenSource"/> after
+    /// firing the event — disposing the socket synchronously from within the
+    /// handler tears that CTS down mid-flight and produces an unobserved
+    /// <see cref="ObjectDisposedException"/> on the finalizer thread.
+    ///
+    /// This helper detaches our handlers synchronously (so we stop receiving
+    /// callbacks immediately) but defers the actual <c>socket.Dispose()</c>
+    /// to a <see cref="Task.Run"/> continuation, letting the library finish
+    /// its own teardown before we tear down its underlying state. Any
+    /// race-condition exception on the deferred dispose is swallowed since
+    /// the library was already in the middle of disposing itself.
+    /// </summary>
+    private void DisposeSocketDeferred()
+    {
+        var sock = this.socket;
+        this.socket = null;
+        if (sock == null) return;
+
+        // Detach our handlers up front — we don't want any more callbacks
+        // from this socket, even if the deferred Dispose() is still pending.
+        sock.OnConnected -= this.OnConnect;
+        sock.OnDisconnected -= this.OnDisconnect;
+        sock.OnError -= this.OnError;
+        sock.OnReconnected -= this.OnReconnect;
+        sock.Off("message");
+        sock.Off("audio");
+        sock.Off("serverDisconnect");
+        sock.Off("ping");
+        sock.Off("premiumStatus");
+        sock.Off("adminStatus");
+        sock.Off("muteState");
+        sock.Off("udpCredentials");
+
+        Task.Run(() =>
+        {
+            try
+            {
+                sock.Dispose();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Library already tore its own internal state down — expected
+                // race when disconnecting at the same instant the server
+                // closes the socket. Nothing to do.
+            }
+            catch (Exception ex)
+            {
+                this.logger.Debug("Deferred socket dispose threw: {0}", ex.Message);
+            }
+        });
     }
 
     private void OnConnect(object? sender, EventArgs args)
@@ -352,7 +435,9 @@ public sealed class SignalingChannel : IDisposable
             }
             StopLatencyPingLoop();
             this.OnDisconnected?.Invoke();
-            this.DisposeSocket();
+            // Fires from inside the library's InvokeDisconnect — defer the
+            // Dispose so the library can finish its own internal teardown.
+            this.DisposeSocketDeferred();
         }
         catch (Exception ex)
         {
@@ -369,10 +454,9 @@ public sealed class SignalingChannel : IDisposable
         this.disconnectCts?.Dispose();
         this.disconnectCts = null;
         this.OnErrored?.Invoke();
-        // There's a known exception here when attempting to connect again, due to the strange way
-        // the Socket.IO for .NET library internally handles Task state transitions.
-        // But it's avoidable if we dispose the socket entirely
-        this.DisposeSocket();
+        // Same race as OnDisconnect: the library still touches its own CTS
+        // after this handler returns. Defer the actual socket dispose.
+        this.DisposeSocketDeferred();
     }
 
     private void OnReconnect(object? sender, int attempts)
@@ -435,10 +519,84 @@ public sealed class SignalingChannel : IDisposable
         }
     }
 
+    // Fields are populated by SocketIOClient's reflection-based JSON
+    // deserializer, which the C# compiler can't see — hence the CS0649
+    // "field is never assigned" false positive. Disable the warning around
+    // each inbound payload struct.
+#pragma warning disable CS0649
     private struct PremiumStatusPayload
     {
         public bool premium;
     }
+#pragma warning restore CS0649
+
+    /// <summary>
+    /// v3+ only. Server emits "udpCredentials" right after the post-ready
+    /// roster broadcast, on every connection. Carries the per-session
+    /// AES-128-GCM key + opaque session id + UDP endpoint. Subscribers
+    /// (<c>VoiceRoomManager</c>) hand these to a <c>UdpAudioChannel</c>
+    /// and start the UDP hello-handshake; on failure the existing Socket.IO
+    /// audio fallback continues to work without further action.
+    /// </summary>
+    private void OnUdpCredentialsCallback(SocketIOResponse response)
+    {
+        try
+        {
+            var payload = response.GetValue<UdpCredentialsPayload>();
+
+            // sessionId and sessionKey arrive as hex strings — decode here
+            // so the consumer always sees the binary form.
+            byte[] sessionId, sessionKey;
+            try
+            {
+                sessionId = Convert.FromHexString(payload.sessionId ?? string.Empty);
+                sessionKey = Convert.FromHexString(payload.sessionKey ?? string.Empty);
+            }
+            catch (FormatException ex)
+            {
+                this.logger.Warn("udpCredentials: bad hex ({0}); UDP disabled for this session.", ex.Message);
+                return;
+            }
+            if (sessionId.Length != 8 || sessionKey.Length != 16)
+            {
+                this.logger.Warn(
+                    "udpCredentials: wrong sizes (sessionId={0}b, sessionKey={1}b); UDP disabled.",
+                    sessionId.Length, sessionKey.Length);
+                return;
+            }
+            if (string.IsNullOrWhiteSpace(payload.udpHost) || payload.udpPort <= 0 || payload.udpPort > 65535)
+            {
+                this.logger.Warn("udpCredentials: invalid endpoint {0}:{1}; UDP disabled.",
+                    payload.udpHost ?? "(null)", payload.udpPort);
+                return;
+            }
+
+            var creds = new UdpCredentials
+            {
+                SessionIdBytes = sessionId,
+                SessionKey = sessionKey,
+                UdpHost = payload.udpHost,
+                UdpPort = payload.udpPort,
+                TtlSeconds = payload.ttlSeconds,
+            };
+            this.OnUdpCredentialsReceived?.Invoke(creds);
+        }
+        catch (Exception ex)
+        {
+            this.logger.Debug("udpCredentials parse failed: {0}", ex.Message);
+        }
+    }
+
+#pragma warning disable CS0649 // deserialized via reflection — see PremiumStatusPayload
+    private struct UdpCredentialsPayload
+    {
+        public string? sessionId;     // hex
+        public string? sessionKey;    // hex
+        public string? udpHost;
+        public int udpPort;
+        public int ttlSeconds;
+    }
+#pragma warning restore CS0649
 
     /// <summary>
     /// Server emits "adminStatus" right after "premiumStatus" in `ready`.
@@ -460,10 +618,12 @@ public sealed class SignalingChannel : IDisposable
         }
     }
 
+#pragma warning disable CS0649 // deserialized via reflection — see PremiumStatusPayload
     private struct AdminStatusPayload
     {
         public bool isAdmin;
     }
+#pragma warning restore CS0649
 
     /// <summary>
     /// Server emits "muteState" only to admins in the same room as the
@@ -487,12 +647,14 @@ public sealed class SignalingChannel : IDisposable
         }
     }
 
+#pragma warning disable CS0649 // deserialized via reflection — see PremiumStatusPayload
     private struct MuteStatePayload
     {
         public string peerId;
         public bool muted;
         public bool self;
     }
+#pragma warning restore CS0649
 
     /// <summary>
     /// Admin command: silently mute (or unmute) a peer for the entire
@@ -657,7 +819,10 @@ public sealed class SignalingChannel : IDisposable
         // throws an exception due to cancellation token subscriptions.
         this.disconnectCts?.Dispose();
         this.disconnectCts = null;
-        this.DisposeSocket();
+        // Defer the actual socket dispose: this handler is invoked from inside
+        // the SocketIOClient event loop, and the library can race with us
+        // tearing down its internal state — see DisposeSocketDeferred docs.
+        this.DisposeSocketDeferred();
 
         // Since Dalamud 12, this message no longer auto disconnects the client.
         this.OnDisconnected?.Invoke();

@@ -26,6 +26,15 @@ public sealed class PlaybackChannel : IDisposable
     public WaveInEventArgs? LastSampleAdded { get; set; }
     public int LastSampleAddedTimestampMs { get; set; }
     public int BufferClearedEventTimestampMs { get; set; }
+
+    /// <summary>
+    /// True if the most recent inbound audio frame for this peer arrived
+    /// over the UDP transport. Drives the adaptive jitter-buffer target:
+    /// 80 ms for UDP-delivered peers, 200 ms for TCP-delivered peers,
+    /// because UDP doesn't have TCP's burst-after-stall pattern that the
+    /// larger buffer was sized to absorb.
+    /// </summary>
+    public bool LastFrameFromUdp { get; set; }
     public WebRtcVad VoiceActivityDetector { get; set; } = new()
     {
         FrameLength = FrameLength.Is20ms,

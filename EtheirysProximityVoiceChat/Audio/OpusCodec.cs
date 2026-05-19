@@ -60,17 +60,28 @@ public sealed class OpusCodec : IDisposable
     /// Create a codec session.
     /// </summary>
     /// <param name="bitrateBps">Target encoder bitrate. 24 kbps is the bare minimum for
-    /// intelligible voice; 32 kbps is the sweet spot for clear conversational audio; 48 kbps
-    /// approaches transparency. We default to 32 — bandwidth is still trivial vs the v1 PCM mesh.</param>
+    /// intelligible voice; 32 kbps is conversational-clear but produces audible compression
+    /// artifacts on the receiver (the "robotic / alien" sound on slower or jittery links);
+    /// 48 kbps is the comfortable sweet spot — bandwidth cost is still trivial (~3 KB/s per
+    /// peer) and the audio quality is noticeably cleaner. Discord runs Opus at ~64 kbps for
+    /// reference.</param>
     /// <param name="packetLossPercent">Hint to the encoder about expected wire packet loss
-    /// (0–100). Drives how much FEC overhead it budgets. 5 is a reasonable default for the
-    /// open internet without being wasteful.</param>
-    public OpusCodec(ILogger logger, int bitrateBps = 32000, int packetLossPercent = 5)
+    /// (0–100). Drives how much FEC overhead it budgets. Effective only when
+    /// <c>UseInbandFEC</c> is on.</param>
+    public OpusCodec(ILogger logger, int bitrateBps = 48000, int packetLossPercent = 5)
     {
         this.logger = logger;
         this.encoder = OpusCodecFactory.CreateEncoder(SampleRate, Channels, OpusApplication.OPUS_APPLICATION_VOIP);
         this.encoder.Bitrate = bitrateBps;
-        this.encoder.UseInbandFEC = true;           // generate redundant coded data for resilience
+        // In-band FEC is ON for v3+ (UDP transport): each packet carries a
+        // redundant low-bitrate copy of the previous frame, which the
+        // receiver decodes via Decode(..., decode_fec: true) immediately
+        // after detecting a sequence-number gap. On the TCP fallback path
+        // there's no gap detection (and TCP itself doesn't lose packets,
+        // just delays them), so the FEC bits go unused — a small quality
+        // cost (~10% of bits per packet) that we accept to keep one set of
+        // encoder settings for both transports.
+        this.encoder.UseInbandFEC = true;
         this.encoder.PacketLossPercent = Math.Clamp(packetLossPercent, 0, 100);
         this.encoder.UseDTX = true;                 // silence suppression on the wire
         this.encoder.Complexity = 10;               // max quality; voice frames are tiny so CPU cost is irrelevant
@@ -123,8 +134,27 @@ public sealed class OpusCodec : IDisposable
     /// <summary>
     /// Decode one Opus packet from the given peer into a 16-bit PCM byte buffer
     /// of exactly <see cref="BytesPerFrame"/> bytes. Returns null on failure.
+    /// Always decodes the packet's primary frame (i.e. <c>decode_fec: false</c>).
+    /// For FEC-based recovery of a previously-dropped frame, call
+    /// <see cref="DecodeFecRecovered"/> on the same packet first, then this.
     /// </summary>
     public byte[]? Decode(string peerId, byte[] opusPacket)
+        => DecodeInternal(peerId, opusPacket, decodeFec: false);
+
+    /// <summary>
+    /// Pull the FEC payload out of <paramref name="opusPacket"/> to reconstruct
+    /// the <em>previous</em> frame from this peer (i.e. the frame that arrived
+    /// in the seq slot just before this packet). Used when the receiver
+    /// detects a one-frame gap in the sender's sequence numbers: call this
+    /// to recover the missing audio, then call <see cref="Decode"/> on the
+    /// same packet to decode the current frame normally.
+    /// Returns null when no FEC data is embedded (e.g. the peer's encoder
+    /// didn't have FEC enabled, or the FEC budget for this packet was 0).
+    /// </summary>
+    public byte[]? DecodeFecRecovered(string peerId, byte[] opusPacket)
+        => DecodeInternal(peerId, opusPacket, decodeFec: true);
+
+    private byte[]? DecodeInternal(string peerId, byte[] opusPacket, bool decodeFec)
     {
         if (this.disposed) return null;
         // Defensive: a peer running an older build may be transmitting Opus DTX
@@ -146,11 +176,14 @@ public sealed class OpusCodec : IDisposable
             // on the same decoder corrupt its internal state and produce static / scrambled audio.
             lock (entry.Lock)
             {
-                decoded = entry.Decoder.Decode(opusPacket.AsSpan(), samples, SamplesPerFrame, decode_fec: false);
+                decoded = entry.Decoder.Decode(opusPacket.AsSpan(), samples, SamplesPerFrame, decode_fec: decodeFec);
             }
             if (decoded != SamplesPerFrame)
             {
-                // Mismatched frame size — packet is malformed for our config.
+                // Mismatched frame size — packet is malformed for our config,
+                // OR (on the FEC path) the packet carried no FEC data for the
+                // previous frame. Either way, signal "no useful output" to the
+                // caller; on the FEC path this just means the gap stays a gap.
                 return null;
             }
         }
@@ -158,7 +191,7 @@ public sealed class OpusCodec : IDisposable
         {
             // Logged at Debug level intentionally: peers on mismatched builds can produce
             // a constant stream of these (one per frame ≈ 50/sec), which would drown /xllog.
-            this.logger.Debug("Opus decode failed for peer {0}: {1}", peerId, ex.Message);
+            this.logger.Debug("Opus decode failed for peer {0} (fec={1}): {2}", peerId, decodeFec, ex.Message);
             return null;
         }
 

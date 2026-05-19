@@ -30,7 +30,14 @@ namespace EtheirysProximityVoiceChat.Audio;
 
 public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
 {
-    public bool IsAudioRecordingSourceActive => PlayingBackMicAudio || (!MuteMic && !Deafen && AudioRecordingIsRequested);
+    // Note: MuteMic / Deafen are deliberately NOT in this condition. With
+    // WASAPI capture, closing / reopening the device on every mute toggle
+    // costs ~100+ ms of init time per cycle, which manifests as the first
+    // syllable after unmute being clipped. The new pattern keeps the
+    // capture device hot whenever the plugin wants any voice activity at
+    // all, and gates outgoing-frame emission at the data callback instead
+    // (see OnAudioSourceDataAvailable).
+    public bool IsAudioRecordingSourceActive => PlayingBackMicAudio || AudioRecordingIsRequested;
     public bool IsAudioPlaybackSourceActive => PlayingBackMicAudio || (!Deafen && AudioPlaybackIsRequested);
 
     public bool MuteMic
@@ -103,8 +110,17 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             if (this.audioRecordingDeviceIndex != value)
             {
                 this.audioRecordingDeviceIndex = value;
+                // Persist by WASAPI ID, not integer index — that's what
+                // survives reboots / USB hotplug. The legacy int field is
+                // kept in sync for one release for backwards compatibility.
+                this.configuration.SelectedAudioInputDeviceWasapiId = LookupRecordingWasapiId(value) ?? string.Empty;
                 this.configuration.SelectedAudioInputDeviceIndex = value;
                 this.configuration.Save();
+
+                // A new device means a clean slate: clear any error from the
+                // previous device so the UI banner goes away as soon as the
+                // user picks a different mic.
+                this.LastMicError = null;
 
                 DisposeAudioRecordingSource();
                 UpdateSourceStates();
@@ -141,7 +157,29 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
     private const int FrameLength = 20; // 20 ms, for max compatibility
     private const int WaveOutDesiredLatency = 100;
     private const int WaveOutNumberOfBuffers = 5;
-    private const int MinimumBufferClearIntervalMs = 5000;
+    /// <summary>
+    /// Target depth of each peer's playback jitter buffer in milliseconds,
+    /// chosen per-peer based on the transport that delivered their most
+    /// recent frame. UDP-delivered peers get the smaller target because
+    /// UDP doesn't have TCP's burst-after-stall pattern that the larger
+    /// buffer was sized to absorb; the smaller target also cuts mouth-to-
+    /// ear latency by ~120 ms for UDP peers. TCP-fallback peers keep the
+    /// larger 200 ms target because their packets can still arrive in
+    /// bursts after a transient stall, and the smaller target underruns
+    /// during those bursts.
+    /// </summary>
+    private const int PerPeerJitterBufferTargetUdpMs = 80;
+    private const int PerPeerJitterBufferTargetTcpMs = 200;
+
+    /// <summary>
+    /// Maximum buffer capacity we'll ever reach — the worst-case bound for
+    /// the TCP fallback. The per-frame logic in <see cref="AddPlaybackSample"/>
+    /// picks an effective target between
+    /// <see cref="PerPeerJitterBufferTargetUdpMs"/> and
+    /// <see cref="PerPeerJitterBufferTargetTcpMs"/> based on the most
+    /// recent frame's transport.
+    /// </summary>
+    private const int PerPeerJitterBufferTargetMs = PerPeerJitterBufferTargetTcpMs;
     /// <summary>
     /// Number of consecutive non-speech frames the VAD must see after speech ends
     /// before we mute outgoing audio. At 20 ms/frame, 15 frames = 300 ms — long
@@ -174,7 +212,7 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
     // Decremented each silent frame; reset whenever speech is detected.
     private int speechHangoverFramesRemaining;
 
-    private WaveInEvent? audioRecordingSource;
+    private WasapiAudioRecorder? audioRecordingSource;
     private WaveOutEvent? audioPlaybackSource;
     private Denoiser? denoiser;
     private volatile bool recording;
@@ -182,6 +220,46 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
     private WaveInEventArgs? lastAudioRecordingSourceData;
     private ISampleProvider? currentSfx;
     private TaskCompletionSource? currentSfxTcs;
+
+    /// <summary>
+    /// Parallel to the friendly-name list returned by
+    /// <see cref="GetAudioRecordingDevices"/>. Position 0 is null (the
+    /// system-default capture device), positions 1+ are stable WASAPI
+    /// device IDs. The UI keeps talking in terms of integer indices, but
+    /// what we actually persist (and reopen with) is the ID at the matching
+    /// position — so plugging / unplugging USB devices across reboots no
+    /// longer silently switches the active mic.
+    /// </summary>
+    private readonly List<string?> audioRecordingDeviceIds = new();
+
+    /// <summary>
+    /// Last fatal error from the WASAPI capture path, or null when capture
+    /// is healthy. Surfaced by the ConfigWindow as a red banner under the
+    /// device dropdown so users actually find out why their mic went silent
+    /// instead of just hearing nothing.
+    /// </summary>
+    public Exception? LastMicError { get; private set; }
+
+    /// <summary>
+    /// Peak sample magnitude (0..1) of the most recently captured 20 ms
+    /// frame <em>after</em> the <see cref="Configuration.InputBoost"/> gain
+    /// has been applied — the level the user is actually transmitting, and
+    /// therefore the level the UI meter should reflect. 0 when not
+    /// recording. Updated on the capture thread; one-frame lag is invisible
+    /// at 50 Hz.
+    /// </summary>
+    public float MicInputPeak => this.micInputPeakPostBoost;
+    private float micInputPeakPostBoost;
+
+    /// <summary>
+    /// True when the boosted mic signal saturated (peak &gt;= 0.99) within
+    /// the last <see cref="ClipIndicatorHoldMs"/> ms. The ConfigWindow
+    /// colours the input-level meter red while this is true so an
+    /// over-boosted user notices immediately.
+    /// </summary>
+    public bool MicInputClipped => Environment.TickCount64 - this.lastClipTickMs < ClipIndicatorHoldMs;
+    private const int ClipIndicatorHoldMs = 300;
+    private long lastClipTickMs = long.MinValue;
 
     public static byte[] ConvertAudioSampleToByteArray(WaveInEventArgs args)
     {
@@ -215,7 +293,15 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
 
         this.muteMic = configuration.MuteMic;
         this.deafen = configuration.Deafen;
-        this.audioRecordingDeviceIndex = configuration.SelectedAudioInputDeviceIndex;
+
+        // Eagerly enumerate WASAPI capture devices so we can resolve the
+        // persisted WASAPI ID into a UI-friendly position before the first
+        // UI frame draws. Without this the UI dropdown defaults to position
+        // 0 for one frame, which flicker-clobbers the user's saved device.
+        _ = GetAudioRecordingDevices();
+        MigrateLegacyRecordingDeviceIndexIfNeeded();
+        this.audioRecordingDeviceIndex = ResolveRecordingDeviceIndexFromWasapiId(configuration.SelectedAudioInputDeviceWasapiId);
+
         this.audioPlaybackDeviceIndex = configuration.SelectedAudioOutputDeviceIndex;
 
         // Align the field-initialized VAD instance with the persisted user
@@ -223,8 +309,11 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
         // existing configs that don't carry VadSensitivity yet.
         SetVadOperatingMode(configuration.VadSensitivity);
 
-        // This is how buffer size is calculated in WaveOutEvent
-        this.maxPlaybackChannelBufferSize = this.waveFormat.ConvertLatencyToByteSize((WaveOutDesiredLatency + WaveOutNumberOfBuffers - 1) / WaveOutNumberOfBuffers) * WaveOutNumberOfBuffers;
+        // Decoupled from WaveOutDesiredLatency: the OS-level audio queue
+        // can stay short (low local playback latency) while the per-peer
+        // jitter buffer is generous enough to absorb TCP-burst inter-arrival
+        // variation on slower / lossier links. See PerPeerJitterBufferTargetMs.
+        this.maxPlaybackChannelBufferSize = this.waveFormat.AverageBytesPerSecond * PerPeerJitterBufferTargetMs / 1000;
 
         this.micPlaybackWaveProvider = new(this.waveFormat);
         this.micPlaybackVolumeProvider = new(this.micPlaybackWaveProvider.ToSampleProvider());
@@ -264,20 +353,34 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
 
     public IEnumerable<string> GetAudioRecordingDevices()
     {
-        // The truncated names from WinMM (e.g. "Microphone (2- Arctis Nova 7 Ge")
-        // would render the dropdown unreadable, so resolve full friendly names
-        // from WASAPI and key them by the WinMM index that WaveInEvent uses.
-        var fullNames = TryResolveFullDeviceNames(DataFlow.Capture, WaveIn.DeviceCount, GetWaveInProductName);
+        // Enumerate WASAPI capture endpoints directly — full friendly names,
+        // stable IDs, and the same view of devices the Windows Sound Control
+        // Panel shows. The legacy WinMM index → friendly-name workaround in
+        // TryResolveFullDeviceNames is no longer needed for the input side.
+        //
+        // Rebuild the parallel id list so the persisted WASAPI ID
+        // (Configuration.SelectedAudioInputDeviceWasapiId) can be mapped to
+        // a UI position on demand.
+        this.audioRecordingDeviceIds.Clear();
+        this.audioRecordingDeviceIds.Add(null); // position 0 == "Default"
 
-        for (int n = -1; n < WaveIn.DeviceCount; n++)
+        var names = new List<string> { "Default" };
+        try
         {
-            if (n == -1)
+            foreach (var (friendlyName, id) in WasapiAudioRecorder.EnumerateCaptureEndpoints())
             {
-                yield return "Default";
-                continue;
+                names.Add(friendlyName);
+                this.audioRecordingDeviceIds.Add(id);
             }
-            yield return fullNames[n];
         }
+        catch (Exception ex)
+        {
+            // MMDeviceEnumerator can throw on a misconfigured audio service.
+            // Logging at Error here so users / maintainers can see why the
+            // dropdown is empty instead of silently showing only "Default".
+            this.logger.Error("Failed to enumerate WASAPI capture endpoints: {0}", ex);
+        }
+        return names;
     }
 
     public IEnumerable<string> GetAudioPlaybackDevices()
@@ -419,30 +522,67 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
         }
     }
 
-    public void AddPlaybackSample(string channelName, WaveInEventArgs sample)
+    public void AddPlaybackSample(string channelName, WaveInEventArgs sample, bool fromUdp = false)
     {
         lock (this.playbackChannelsLock)
         {
             if (!this.playbackChannels.TryGetValue(channelName, out var channel)) return;
-            var now = Environment.TickCount;
-            // If the output device cannot read from the playback buffer as fast as it is filled,
-            // then the playback buffer can get filled and introduce audio latency.
-            // This can occur during high system load.
-            // To remove this latency, we ensure the playback buffer never goes above the expected buffer size,
-            // calculated from the intended output device latency and buffer count.
-            if (channel.BufferedWaveProvider.BufferedBytes + sample.BytesRecorded > this.maxPlaybackChannelBufferSize)
+            // Tag the channel with its current transport so the adaptive
+            // jitter buffer target picks the right depth. A peer's transport
+            // can flip during a session (e.g. UDP went silent → server
+            // reverts to TCP); we just trust the most recent frame.
+            channel.LastFrameFromUdp = fromUdp;
+
+            // Per-frame effective target: small for UDP (which doesn't
+            // burst-after-stall), large for TCP (which does). The
+            // BufferedWaveProvider's actual capacity is set wide at channel
+            // creation; this is a soft target that drives drop-oldest
+            // overflow handling below.
+            var effectiveTargetMs = fromUdp ? PerPeerJitterBufferTargetUdpMs : PerPeerJitterBufferTargetTcpMs;
+            var effectiveTargetBytes = this.waveFormat.AverageBytesPerSecond * effectiveTargetMs / 1000;
+
+            // Jitter buffer: keep the per-peer playback queue at or below
+            // PerPeerJitterBufferTargetMs (~200 ms). When new samples would
+            // push past that target, drop the OLDEST bytes from the queue
+            // rather than discarding the new sample (which is what the
+            // BufferedWaveProvider does on its own with
+            // DiscardOnBufferOverflow=true, producing audible gaps) or
+            // clearing the entire queue (the old rate-limited behaviour,
+            // which the existing codebase comment correctly identified as
+            // a source of "roboting").
+            //
+            // Dropping a small chunk of *old* audio per overflow event
+            // means the listener loses maybe 20–40 ms of buffered audio
+            // rather than continuing to hear stale content while new
+            // packets are silently discarded; the result is brief,
+            // localised skips instead of sustained gaps. This is also the
+            // mechanism that recovers from sender / receiver clock drift,
+            // which the old "clear every 5 s" code was trying to handle.
+            var bufferedBytes = channel.BufferedWaveProvider.BufferedBytes;
+            var afterAdd = bufferedBytes + sample.BytesRecorded;
+            if (afterAdd > effectiveTargetBytes)
             {
-                // However, don't clear too often as this can cause audio "roboting"
-                var timeSinceLastBufferClear = now - channel.BufferClearedEventTimestampMs;
-                if (timeSinceLastBufferClear > MinimumBufferClearIntervalMs)
+                var bytesToDrop = afterAdd - effectiveTargetBytes;
+                // Round to a whole sample to avoid splitting a 16-bit value.
+                if ((bytesToDrop & 1) == 1) bytesToDrop++;
+                // Cap at the currently-buffered amount: if we're somehow
+                // asked to drop more than is queued, we just drain what's
+                // there and the new sample will fit cleanly.
+                if (bytesToDrop > bufferedBytes) bytesToDrop = bufferedBytes;
+
+                var discard = new byte[bytesToDrop];
+                int dropped = 0;
+                while (dropped < bytesToDrop)
                 {
-                    channel.BufferedWaveProvider.ClearBuffer();
-                    channel.BufferClearedEventTimestampMs = now;
+                    var n = channel.BufferedWaveProvider.Read(discard, dropped, bytesToDrop - dropped);
+                    if (n <= 0) break;
+                    dropped += n;
                 }
             }
+
             channel.BufferedWaveProvider.AddSamples(sample.Buffer, 0, sample.BytesRecorded);
             channel.LastSampleAdded = sample;
-            channel.LastSampleAddedTimestampMs = now;
+            channel.LastSampleAddedTimestampMs = Environment.TickCount;
         }
     }
 
@@ -531,32 +671,146 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
         return this.currentSfxTcs.Task;
     }
 
-    private WaveInEvent? GetAudioRecordingSource(bool createIfNull)
+    private WasapiAudioRecorder? GetAudioRecordingSource(bool createIfNull)
     {
         if (this.audioRecordingSource == null && createIfNull)
         {
-            if (this.AudioRecordingDeviceIndex >= WaveIn.DeviceCount)
+            // Resolve the persisted WASAPI ID at create-time so device hot-
+            // swaps between StartRecording calls are picked up automatically
+            // — and so a user who unplugs the saved device after launch
+            // falls back to the default cleanly (handled inside the recorder).
+            var wasapiId = LookupRecordingWasapiId(this.audioRecordingDeviceIndex);
+
+            try
             {
-                // Avoid callbacks
-                this.audioRecordingDeviceIndex = -1;
+                this.audioRecordingSource = new WasapiAudioRecorder(wasapiId, this.logger);
+            }
+            catch (Exception ex)
+            {
+                // Constructor can throw if the audio service is unavailable
+                // or MMDeviceEnumerator fails. Surface this rather than
+                // letting it crash UpdateSourceStates() and the calling
+                // VoiceRoomManager path.
+                this.logger.Error("Failed to create WasapiAudioRecorder: {0}", ex);
+                this.LastMicError = ex;
+                return null;
             }
 
-            this.audioRecordingSource = new WaveInEvent
-            {
-                DeviceNumber = this.AudioRecordingDeviceIndex,
-                WaveFormat = this.waveFormat,
-                BufferMilliseconds = 20, // 20 ms for max compatibility
-            };
-
-            this.audioRecordingSource.RecordingStopped += (object? sender, StoppedEventArgs e) =>
-            {
-                this.recording = false;
-            };
+            this.audioRecordingSource.RecordingStopped += OnRecordingSourceStopped;
             this.audioRecordingSource.DataAvailable += this.OnAudioSourceDataAvailable;
 
             this.recording = false;
         }
         return this.audioRecordingSource;
+    }
+
+    private void OnRecordingSourceStopped(object? sender, StoppedEventArgs e)
+    {
+        this.recording = false;
+        // Promote the WASAPI error to a property the UI watches. An expected
+        // user-initiated stop has Exception == null and leaves LastMicError
+        // alone, so we don't flash an error banner when the user disables
+        // their mic via the plugin settings.
+        if (e.Exception != null)
+        {
+            this.LastMicError = e.Exception;
+        }
+    }
+
+    /// <summary>
+    /// Tear down and re-create the WASAPI capture source. Wired to the
+    /// ConfigWindow's "Retry" button (next to the LastMicError banner) so
+    /// users can recover after a transient failure (e.g. they re-enabled
+    /// their mic in Windows Sound Control Panel) without restarting the
+    /// plugin.
+    /// </summary>
+    public void RestartMic()
+    {
+        this.LastMicError = null;
+        DisposeAudioRecordingSource();
+        UpdateSourceStates();
+    }
+
+    /// <summary>
+    /// Look up the WASAPI ID parked at a given UI position.
+    /// <paramref name="audioRecordingIndex"/> uses the -1-is-Default
+    /// convention (i.e. it's <c>AudioRecordingDeviceIndex</c>). Returns null
+    /// when the index points to "Default" or out of range; the recorder
+    /// treats null as "use system default capture device".
+    /// </summary>
+    private string? LookupRecordingWasapiId(int audioRecordingIndex)
+    {
+        var pos = audioRecordingIndex + 1; // -1 → 0, 0 → 1, etc.
+        if (pos <= 0 || pos >= this.audioRecordingDeviceIds.Count) return null;
+        return this.audioRecordingDeviceIds[pos];
+    }
+
+    /// <summary>
+    /// Find which UI position holds a given WASAPI ID. Returns the
+    /// corresponding <c>AudioRecordingDeviceIndex</c> value (i.e. -1 for
+    /// Default, 0+ for a specific device). When the ID isn't in the current
+    /// device list — saved device unplugged, audio service rebooted, etc. —
+    /// returns -1 so the UI shows "Default" rather than a stale selection.
+    /// </summary>
+    private int ResolveRecordingDeviceIndexFromWasapiId(string? wasapiId)
+    {
+        if (string.IsNullOrEmpty(wasapiId)) return -1;
+        for (int i = 1; i < this.audioRecordingDeviceIds.Count; i++)
+        {
+            if (this.audioRecordingDeviceIds[i] == wasapiId) return i - 1;
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// One-time migration from the legacy WinMM integer device index to a
+    /// stable WASAPI ID. Runs in the constructor if
+    /// <see cref="Configuration.SelectedAudioInputDeviceWasapiId"/> is empty
+    /// AND <see cref="Configuration.SelectedAudioInputDeviceIndex"/> points
+    /// at a real WinMM device. Matches the truncated WinMM friendly-name
+    /// prefix against full WASAPI <c>MMDevice.FriendlyName</c>s — the same
+    /// approach the old <c>TryResolveFullDeviceNames</c> used for display.
+    /// </summary>
+    private void MigrateLegacyRecordingDeviceIndexIfNeeded()
+    {
+        if (!string.IsNullOrEmpty(this.configuration.SelectedAudioInputDeviceWasapiId)) return;
+        var legacyIndex = this.configuration.SelectedAudioInputDeviceIndex;
+        if (legacyIndex < 0) return;
+
+        string? winMmName = null;
+        try { winMmName = WaveIn.GetCapabilities(legacyIndex).ProductName; }
+        catch (Exception ex)
+        {
+            this.logger.Debug("Legacy WinMM device {0} no longer present for migration: {1}", legacyIndex, ex.Message);
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(winMmName)) return;
+
+        // WinMM names are capped at 31 chars (MAXPNAMELEN-1). A WASAPI
+        // friendly name that starts with that prefix is the same device.
+        string? matchedId = null;
+        string? matchedName = null;
+        foreach (var (friendlyName, id) in WasapiAudioRecorder.EnumerateCaptureEndpoints())
+        {
+            if (friendlyName.StartsWith(winMmName, StringComparison.Ordinal))
+            {
+                matchedId = id;
+                matchedName = friendlyName;
+                break;
+            }
+        }
+
+        if (matchedId != null)
+        {
+            this.logger.Info("Migrated mic selection: WinMM index {0} ('{1}') -> WASAPI '{2}' (id={3}).",
+                legacyIndex, winMmName, matchedName ?? "(unnamed)", matchedId);
+            this.configuration.SelectedAudioInputDeviceWasapiId = matchedId;
+            this.configuration.Save();
+        }
+        else
+        {
+            this.logger.Info("Could not match legacy WinMM device '{0}' to any WASAPI endpoint; falling back to default capture device.", winMmName);
+        }
     }
 
     private void DisposeAudioRecordingSource()
@@ -618,18 +872,47 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
     {
         if (!this.recording) { return; }
         //this.logger.Trace("Audio data received from recording device: {0} bytes recorded, {1}", e.BytesRecorded, e.Buffer);
+
+        // Pipeline order (chosen for the "boost + cuts out" symptom):
+        //
+        //   1. RNNoise denoise — operates on the device's natural signal
+        //      level, which is what it was trained on. Boosting first
+        //      caused RNNoise to over-attenuate (mistaking boosted room
+        //      noise for loud noise to suppress), which then made VAD
+        //      decide the result wasn't speech and zero the frame.
+        //   2. InputBoost gain — brings the cleaned signal up to a real
+        //      transmission level *after* denoising. This is the gain that
+        //      both the user hears (loopback) and peers hear (wire).
+        //   3. VAD gate — sees the boosted, clean signal and reliably
+        //      classifies it as speech, so quiet voices stop being false-
+        //      negatived into silence.
+        //   4. Peak/clip detection — on the final post-gate frame, so the
+        //      UI meter shows what's actually leaving the plugin. If the
+        //      VAD is over-gating, the meter visibly drops to zero — a
+        //      direct diagnostic the user can act on.
+
         if (this.configuration.SuppressNoise && this.denoiser != null)
         {
             Convert16BitToFloat(e.Buffer, this.denoiserFloatSamples);
             // With incomplete audio data, this method can crash Dalamud
             this.denoiser.Denoise(this.denoiserFloatSamples);
             ConvertFloatTo16Bit(this.denoiserFloatSamples, e.Buffer);
+        }
 
-            // Enhanced gate: after RNNoise removes spectral noise, run the VAD on the
-            // cleaned frame. Frames the VAD doesn't classify as speech get silenced —
-            // Opus DTX then encodes them as ~2-byte comfort-noise packets, so the
-            // wire cost is negligible. A SpeechHangoverFrames-long tail of pass-through
-            // after the last detected-speech frame avoids clipping word endings.
+        var inputBoost = this.configuration.InputBoost;
+        if (inputBoost != 1.0f)
+        {
+            ApplyGainInt16(e.Buffer, e.BytesRecorded, inputBoost);
+        }
+
+        if (this.configuration.SuppressNoise && this.denoiser != null)
+        {
+            // Enhanced gate: VAD on the cleaned + boosted frame. Frames the
+            // VAD doesn't classify as speech get silenced — Opus DTX then
+            // encodes them as ~2-byte comfort-noise packets, so the wire
+            // cost is negligible. A SpeechHangoverFrames-long tail of
+            // pass-through after the last detected-speech frame avoids
+            // clipping word endings.
             if (this.selfVoiceActivityDetector.HasSpeech(e.Buffer))
             {
                 this.speechHangoverFramesRemaining = SpeechHangoverFrames;
@@ -643,12 +926,32 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
                 System.Array.Clear(e.Buffer, 0, e.BytesRecorded);
             }
         }
+
+        // Final-frame peak: what the user is actually transmitting. Updated
+        // here (not earlier) so the meter reflects post-everything output
+        // — boost is visible AND a too-aggressive VAD shows up as the bar
+        // dropping to zero during what feels like normal speech.
+        var finalPeak = ComputePeakInt16(e.Buffer, e.BytesRecorded);
+        this.micInputPeakPostBoost = finalPeak;
+        if (finalPeak >= 0.99f)
+        {
+            this.lastClipTickMs = Environment.TickCount64;
+        }
+
         if (this.audioPlaybackSource != null && this.PlayingBackMicAudio)
         {
             this.micPlaybackWaveProvider.AddSamples(e.Buffer, 0, e.BytesRecorded);
             this.micPlaybackVolumeProvider.LeftVolume = this.micPlaybackVolumeProvider.RightVolume = this.configuration.MasterVolume;
         }
         this.lastAudioRecordingSourceData = e;
+
+        // Gate the wire emission (NOT the loopback above) on mute. Keeping
+        // the capture device + denoiser running through a mute means the
+        // first syllable after unmute is preserved; the user just stops
+        // being transmitted to the room for the duration of the mute. The
+        // MuteMic getter already folds in Deafen, so this covers both.
+        if (this.MuteMic) return;
+
         this.OnAudioRecordingSourceDataAvailable?.Invoke(this, e);
     }
 
@@ -676,17 +979,21 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
         {
             if (!this.recording)
             {
-                this.logger.Debug("Starting audio recording source from device {0}", GetAudioRecordingSource(true)!.DeviceNumber);
-                lock (this.recordingLock)
+                var src = GetAudioRecordingSource(true);
+                if (src != null)
                 {
-                    GetAudioRecordingSource(true)!.StartRecording();
+                    this.logger.Debug("Starting audio recording source from device '{0}'", src.DeviceFriendlyName);
+                    lock (this.recordingLock)
+                    {
+                        src.StartRecording();
+                    }
+                    // We need a new denoiser here as the previous denoiser may have remaining incomplete audio data
+                    // that can cause audio popping the next time it is used.
+                    this.denoiser?.Dispose(); this.denoiser = null;
+                    this.denoiser = new();
+                    this.speechHangoverFramesRemaining = 0;
+                    this.recording = true;
                 }
-                // We need a new denoiser here as the previous denoiser may have remaining incomplete audio data
-                // that can cause audio popping the next time it is used.
-                this.denoiser?.Dispose(); this.denoiser = null;
-                this.denoiser = new();
-                this.speechHangoverFramesRemaining = 0;
-                this.recording = true;
             }
         }
         else
@@ -694,7 +1001,7 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             var recordingSource = GetAudioRecordingSource(false);
             if (recordingSource != null)
             {
-                this.logger.Debug("Stopping audio recording source from device {0}", recordingSource.DeviceNumber);
+                this.logger.Debug("Stopping audio recording source from device '{0}'", recordingSource.DeviceFriendlyName);
                 // This lock seems to fix rare crashes caused by native NAudio operations when stopping recording.
                 lock (this.recordingLock)
                 {
@@ -786,5 +1093,44 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             sampleIndex++;
             pcmIndex += 2;
         }
+    }
+
+    /// <summary>
+    /// In-place gain stage on little-endian 16-bit PCM. Each sample is
+    /// multiplied by <paramref name="gain"/> and clamped to the int16 range
+    /// so over-boosted signals saturate rather than wrap (which would produce
+    /// horrible aliasing). Gain == 1.0 is a no-op and the caller already
+    /// short-circuits that case.
+    /// </summary>
+    private static void ApplyGainInt16(byte[] pcm, int byteCount, float gain)
+    {
+        var end = byteCount - 1;
+        for (int i = 0; i < end; i += 2)
+        {
+            short s = (short)(pcm[i] | (pcm[i + 1] << 8));
+            int boosted = (int)(s * gain);
+            if (boosted > short.MaxValue) boosted = short.MaxValue;
+            else if (boosted < short.MinValue) boosted = short.MinValue;
+            pcm[i] = (byte)(boosted & 0xff);
+            pcm[i + 1] = (byte)((boosted >> 8) & 0xff);
+        }
+    }
+
+    /// <summary>
+    /// Maximum absolute sample magnitude across the buffer, normalized to
+    /// [0, 1]. Used for both the live mic-level meter and clip detection
+    /// (peak &gt;= 0.99 triggers the red-flash on the meter).
+    /// </summary>
+    private static float ComputePeakInt16(byte[] pcm, int byteCount)
+    {
+        int peak = 0;
+        var end = byteCount - 1;
+        for (int i = 0; i < end; i += 2)
+        {
+            short s = (short)(pcm[i] | (pcm[i + 1] << 8));
+            int abs = s < 0 ? -s : s;
+            if (abs > peak) peak = abs;
+        }
+        return peak / 32768f;
     }
 }

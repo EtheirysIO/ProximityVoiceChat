@@ -15,6 +15,7 @@
 using NAudio.Wave;
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using EtheirysProximityVoiceChat.Audio;
 using EtheirysProximityVoiceChat.Log;
 using WindowsInput.Events;
@@ -78,6 +79,11 @@ public class PushToTalkController : IAudioDeviceController
     }
     bool IAudioDeviceController.RecordingDataHasActivity => this.baseAudioDeviceController.RecordingDataHasActivity;
 
+    Exception? IAudioDeviceController.LastMicError => this.baseAudioDeviceController.LastMicError;
+    float IAudioDeviceController.MicInputPeak => this.baseAudioDeviceController.MicInputPeak;
+    bool IAudioDeviceController.MicInputClipped => this.baseAudioDeviceController.MicInputClipped;
+    void IAudioDeviceController.RestartMic() => this.baseAudioDeviceController.RestartMic();
+
     void IAudioDeviceController.SetVadOperatingMode(int mode)
     {
         this.baseAudioDeviceController.SetVadOperatingMode(mode);
@@ -93,6 +99,16 @@ public class PushToTalkController : IAudioDeviceController
     private bool audioRecordingIsExternallyRequested;
     private bool listenerSubscribed;
 
+    /// <summary>
+    /// Cancellation source for an in-flight "release delay" timer. When the
+    /// PTT key comes up, we don't disengage immediately — we wait
+    /// <see cref="Configuration.PushToTalkReleaseDelayMs"/> milliseconds so
+    /// the trailing consonant of a word ("test" → "t") isn't clipped. A
+    /// fresh key-press cancels the in-flight timer so a rapid double-tap
+    /// behaves like a single sustained press rather than a brief silence.
+    /// </summary>
+    private CancellationTokenSource? releaseDelayCts;
+
     public PushToTalkController(
         IAudioDeviceController baseAudioDeviceController,
         Configuration configuration,
@@ -107,9 +123,9 @@ public class PushToTalkController : IAudioDeviceController
         UpdateListeners();
     }
 
-    void IAudioDeviceController.AddPlaybackSample(string channelName, WaveInEventArgs sample)
+    void IAudioDeviceController.AddPlaybackSample(string channelName, WaveInEventArgs sample, bool fromUdp)
     {
-        this.baseAudioDeviceController.AddPlaybackSample(channelName, sample);
+        this.baseAudioDeviceController.AddPlaybackSample(channelName, sample, fromUdp);
     }
 
     bool IAudioDeviceController.ChannelHasActivity(string channelName)
@@ -166,6 +182,10 @@ public class PushToTalkController : IAudioDeviceController
             this.logger.Debug("Push to talk disabled. Unsubscribing listeners.");
             this.inputEventSource.UnsubscribeToKeyDown(OnInputKeyDown);
             this.inputEventSource.UnsubscribeToKeyUp(OnInputKeyUp);
+            // Cancel any pending release-delay timer so it doesn't fire
+            // after PTT is disabled and flip PushToTalkKeyDown back to
+            // false a second time (harmless but noisy in logs).
+            CancelReleaseDelay();
             this.PushToTalkKeyDown = false;
             this.listenerSubscribed = false;
         }
@@ -184,6 +204,11 @@ public class PushToTalkController : IAudioDeviceController
         if (binding.Ctrl != InputEventSource.IsCtrlDown()) return;
         if (binding.Alt != InputEventSource.IsAltDown()) return;
 
+        // A new press cancels any in-flight release-delay timer — a rapid
+        // double-tap should behave like one continuous press, not blink the
+        // mic off and back on.
+        CancelReleaseDelay();
+
         this.PushToTalkKeyDown = true;
         if (this.audioRecordingIsExternallyRequested)
         {
@@ -200,12 +225,60 @@ public class PushToTalkController : IAudioDeviceController
         // matching common voice-chat client behaviour (Mumble/Discord).
         if (k.Key != binding.Key) return;
 
-        // TODO: Add release delay
-        this.PushToTalkKeyDown = false;
-        if (this.audioRecordingIsExternallyRequested)
+        // Release delay: keep the mic open for the configured tail so the
+        // trailing phoneme of the last word isn't clipped. Clamp to a sane
+        // range; 0 disables the delay (immediate disengage). Implemented as
+        // a cancellable timer so a key-down inside the window cancels the
+        // delayed disengage — see CancelReleaseDelay above.
+        var delayMs = Math.Clamp(this.configuration.PushToTalkReleaseDelayMs, 0, 2000);
+        if (delayMs <= 0)
         {
-            UpdateBaseAudioRecordingIsRequested();
+            this.PushToTalkKeyDown = false;
+            if (this.audioRecordingIsExternallyRequested)
+            {
+                UpdateBaseAudioRecordingIsRequested();
+            }
+            return;
         }
+
+        // Replace any previous (still-pending) release-delay timer with a
+        // fresh one. The stale one will see its token cancelled and exit.
+        CancelReleaseDelay();
+        var cts = new CancellationTokenSource();
+        this.releaseDelayCts = cts;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(delayMs, cts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return; // pre-empted by a fresh key-press; stay engaged
+            }
+
+            // Re-check cancellation: a key-down arriving immediately after
+            // the delay expires shouldn't trigger a brief disengagement.
+            if (cts.IsCancellationRequested) return;
+
+            this.PushToTalkKeyDown = false;
+            if (this.audioRecordingIsExternallyRequested)
+            {
+                UpdateBaseAudioRecordingIsRequested();
+            }
+        });
+    }
+
+    private void CancelReleaseDelay()
+    {
+        try
+        {
+            this.releaseDelayCts?.Cancel();
+            this.releaseDelayCts?.Dispose();
+        }
+        catch { /* nothing to do */ }
+        this.releaseDelayCts = null;
     }
 
     private void UpdateBaseAudioRecordingIsRequested()

@@ -62,6 +62,7 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
     private readonly Subject<Keybind> clearKeybind = new();
 
     public IReactiveProperty<float> MasterVolume { get; } = new ReactiveProperty<float>();
+    public IReactiveProperty<float> InputBoost { get; } = new ReactiveProperty<float>();
     public IReactiveProperty<AudioFalloffModel.FalloffType> AudioFalloffType { get; } = new ReactiveProperty<AudioFalloffModel.FalloffType>();
     public IReactiveProperty<float> AudioFalloffMinimumDistance { get; } = new ReactiveProperty<float>();
     public IReactiveProperty<float> AudioFalloffMaximumDistance { get; } = new ReactiveProperty<float>();
@@ -223,7 +224,13 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
         using var tabs = ImRaii.TabBar("pvc-config-tabs");
         if (!tabs) return;
 
+        // ShowProfileFeature is a compile-time const false until the premium
+        // profile gate goes live — see field declaration above. The const-fold
+        // makes the body unreachable, so suppress CS0162 to keep the gate
+        // visible in source without compiler noise.
+#pragma warning disable CS0162
         if (ShowProfileFeature) DrawProfileTab();
+#pragma warning restore CS0162
         DrawDeviceTab();
         DrawFalloffTab();
         DrawMiscTab();
@@ -253,6 +260,25 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
             {
                 this.audioDeviceController.AudioRecordingDeviceIndex = inputDeviceIndex - 1;
             }
+
+            // Live mic-input level meter. Updates each capture frame (50 Hz),
+            // smoothed by ImGui's progress-bar rendering. Lets users confirm
+            // "Windows is actually delivering my voice to the plugin" without
+            // having to enable mic playback or coordinate with another peer.
+            // Flashes red when the post-boost signal clips.
+            DrawMicInputLevelMeter();
+
+            // Input boost slider — multiplicative gain applied to the raw
+            // captured PCM before RNNoise/VAD/Opus. Positioned directly
+            // under the meter so users can dial it up while watching the
+            // bar grow (and turn red on overshoot).
+            DrawInputBoostSlider();
+
+            // Error banner: only shown when the capture path has a live
+            // exception. The Retry button restarts the capture device so
+            // users can recover (e.g. after re-enabling the mic in Windows
+            // Sound Control Panel) without a plugin reload.
+            DrawMicErrorBanner();
 
             ImGui.Spacing();
 
@@ -296,11 +322,36 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
             {
                 ImGui.SameLine();
                 DrawKeybindEdit(Keybind.PushToTalk, this.configuration.PushToTalkBinding, "Keybind");
+
+                // Release delay: when the PTT key comes up, keep transmitting
+                // for this many ms before going silent. Preserves the trailing
+                // consonant of the last word; matches the SpeechHangoverFrames
+                // tail on the VAD side. Honoured by PushToTalkController.
+                var releaseDelay = this.configuration.PushToTalkReleaseDelayMs;
+                ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.55f);
+                if (ImGui.SliderInt("##PttReleaseDelay", ref releaseDelay, 0, 500, "%d ms"))
+                {
+                    this.configuration.PushToTalkReleaseDelayMs = Math.Clamp(releaseDelay, 0, 2000);
+                    this.configuration.Save();
+                }
+                if (ImGui.IsItemHovered())
+                {
+                    ImGui.SetTooltip(
+                        "How long to keep the mic open after the PTT key is released.\n" +
+                        "Prevents the trailing sound of your last word from being clipped.\n" +
+                        "Set to 0 for an immediate cutoff.");
+                }
+                ImGui.SameLine();
+                ImGui.TextUnformatted("PTT release delay");
             }
             else if (this.KeybindBeingEdited.Value == Keybind.PushToTalk)
             {
                 this.KeybindBeingEdited.Value = Keybind.None;
             }
+
+            // ── Network / audio transport ─────────────────────────────
+            ImGui.Spacing();
+            DrawAudioTransportControls();
         }
 
         ImGui.Spacing();
@@ -988,6 +1039,153 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
     /// WebRTC VAD oscillates per 20ms frame during natural speech and would
     /// otherwise produce a flickering dot.
     /// </summary>
+    /// <summary>
+    /// Horizontal mic-input level meter drawn under the input-device combo.
+    /// Reads <see cref="IAudioDeviceController.MicInputPeak"/> each frame
+    /// (post-boost, already 0..1) and renders it as a progress bar — green
+    /// by default, red while <see cref="IAudioDeviceController.MicInputClipped"/>
+    /// is true so an over-boosted user notices immediately. Lets a user
+    /// confirm "Windows is delivering my voice to the plugin" without
+    /// having to enable mic playback or coordinate with another peer.
+    /// </summary>
+    private void DrawMicInputLevelMeter()
+    {
+        var peak = Math.Clamp(this.audioDeviceController.MicInputPeak, 0f, 1f);
+        var clipped = this.audioDeviceController.MicInputClipped;
+
+        // Stretch over the same width as the device combo above it (which
+        // uses GetContentRegionAvail by default). Use a fixed short height
+        // so the meter reads as a "meter" rather than a button.
+        var width = ImGui.GetContentRegionAvail().X;
+        var size = new Vector2(width, ImGui.GetFontSize() * 0.45f);
+
+        // Red while the boosted signal saturated recently; green otherwise.
+        // ProgressBar's default text overlay would be empty here so we
+        // suppress the overlay with an empty string.
+        var barColor = clipped
+            ? new Vector4(0.90f, 0.30f, 0.30f, 1f)
+            : new Vector4(0.30f, 0.85f, 0.30f, 1f);
+        using var c = ImRaii.PushColor(ImGuiCol.PlotHistogram, barColor);
+        ImGui.ProgressBar(peak, size, string.Empty);
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(clipped
+                ? $"Mic input level: {(int)(peak * 100)}%% — clipping! Lower the Input Boost slider."
+                : $"Mic input level: {(int)(peak * 100)}%%");
+        }
+    }
+
+    /// <summary>
+    /// Input-boost slider (0..500 %) drawn under the live level meter, so
+    /// the meter and the control that drives it sit side-by-side. Defaults
+    /// to 100 % which means the captured signal is passed through unchanged.
+    /// </summary>
+    private void DrawInputBoostSlider()
+    {
+        var boostPct = this.InputBoost.Value * 100f;
+        ImGui.SetNextItemWidth(ImGui.GetContentRegionAvail().X * 0.55f);
+        if (ImGui.SliderFloat("##InputBoost", ref boostPct, 0f, 500f, "%1.0f%%"))
+        {
+            this.InputBoost.Value = boostPct / 100f;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "Boost the mic signal before it's sent to other peers.\n" +
+                "100% = unchanged. Raise this if your mic is too quiet.\n" +
+                "Watch the level meter above — it turns red when the boost is too high.");
+        }
+        ImGui.SameLine();
+        ImGui.TextUnformatted("Input boost");
+    }
+
+    /// <summary>
+    /// Red banner + Retry button shown only when the capture path has a
+    /// live exception (mic unplugged, device-driver crashed, audio service
+    /// stopped). The Retry button calls
+    /// <see cref="IAudioDeviceController.RestartMic"/> which tears down and
+    /// re-creates the WASAPI capture source.
+    /// </summary>
+    /// <summary>
+    /// Renders the "Prefer UDP audio" checkbox + a live "Audio transport:
+    /// UDP / TCP" status line so users (and bug reports) can see which
+    /// transport is actually in use. The checkbox controls
+    /// <see cref="Configuration.PreferUdpAudio"/> — flipping it off forces
+    /// the Socket.IO path on the next session, which is useful for users
+    /// behind UDP-blocking firewalls who don't want to wait through the
+    /// 5 s hello-ack timeout on every join.
+    /// </summary>
+    private void DrawAudioTransportControls()
+    {
+        var preferUdp = this.configuration.PreferUdpAudio;
+        if (ImGui.Checkbox("Prefer UDP audio", ref preferUdp))
+        {
+            this.configuration.PreferUdpAudio = preferUdp;
+            this.configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "When on (default), the plugin uses a low-latency UDP audio channel\n" +
+                "with automatic fallback to the regular Socket.IO transport if UDP\n" +
+                "can't be established (e.g. behind a corporate firewall).\n" +
+                "Turn off to force the Socket.IO transport globally.");
+        }
+
+        // Live transport indicator. Pulls directly from VoiceRoomManager so
+        // every join updates it without explicit wiring.
+        var transport = this.voiceRoomManager.ActiveAudioTransport;
+        var reason = this.voiceRoomManager.AudioTransportReason;
+        string label;
+        Vector4 color;
+        switch (transport)
+        {
+            case VoiceRoomManager.AudioTransport.Udp:
+                label = "Audio transport: UDP";
+                color = new Vector4(0.55f, 0.90f, 0.55f, 1f);
+                break;
+            case VoiceRoomManager.AudioTransport.Tcp:
+                label = string.IsNullOrEmpty(reason)
+                    ? "Audio transport: TCP"
+                    : $"Audio transport: TCP ({reason})";
+                color = new Vector4(0.95f, 0.80f, 0.45f, 1f);
+                break;
+            default:
+                label = "Audio transport: not connected";
+                color = new Vector4(0.70f, 0.70f, 0.70f, 1f);
+                break;
+        }
+        ImGui.TextColored(color, label);
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "Which network path your captured audio is using right now.\n" +
+                "UDP = lowest latency, packet-loss tolerant.\n" +
+                "TCP = Socket.IO fallback when UDP isn't available.\n" +
+                "Include this line in bug reports about choppy or robotic audio.");
+        }
+    }
+
+    private void DrawMicErrorBanner()
+    {
+        var err = this.audioDeviceController.LastMicError;
+        if (err == null) return;
+
+        ImGui.Spacing();
+        using (var c = ImRaii.PushColor(ImGuiCol.Text, new Vector4(0.95f, 0.45f, 0.45f, 1f)))
+        {
+            ImGui.TextWrapped($"Mic error: {err.Message}");
+        }
+        if (ImGui.Button("Retry##mic-retry"))
+        {
+            this.audioDeviceController.RestartMic();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Try to reopen the selected capture device.");
+        }
+    }
+
     private void DrawPickupIndicator()
     {
         var nowMs = Environment.TickCount64;
