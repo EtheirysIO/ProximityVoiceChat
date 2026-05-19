@@ -39,6 +39,35 @@ public interface IAudioDeviceController
     public bool RecordingDataHasActivity { get; }
 
     /// <summary>
+    /// Most recent fatal error from the capture path, or null when capture
+    /// is healthy. The ConfigWindow renders this as a red banner under the
+    /// mic dropdown with a Retry button so users actually see why their
+    /// mic stopped working.
+    /// </summary>
+    Exception? LastMicError { get; }
+
+    /// <summary>
+    /// Peak sample magnitude (0..1) of the most recently captured frame
+    /// <em>after</em> the <see cref="Configuration.InputBoost"/> gain stage,
+    /// or 0 when capture is idle. Drives the live mic-input meter in the
+    /// ConfigWindow.
+    /// </summary>
+    float MicInputPeak { get; }
+
+    /// <summary>
+    /// True when the boosted mic signal saturated within the last few
+    /// hundred ms. The ConfigWindow flashes the input-level meter red so
+    /// the user notices an over-boosted setting.
+    /// </summary>
+    bool MicInputClipped { get; }
+
+    /// <summary>
+    /// Tear down and re-create the capture device. Used as the "Retry"
+    /// action under the <see cref="LastMicError"/> banner.
+    /// </summary>
+    void RestartMic();
+
+    /// <summary>
     /// Update the WebRTC VAD operating mode on the live self-VAD instance.
     /// Mode is clamped to [0, 3]; out-of-range values fall back to 2 (Aggressive).
     /// </summary>
@@ -50,7 +79,14 @@ public interface IAudioDeviceController
     void CreateAudioPlaybackChannel(string channelName);
     void RemoveAudioPlaybackChannel(string channelName);
 
-    void AddPlaybackSample(string channelName, WaveInEventArgs sample);
+    /// <summary>
+    /// Hand one decoded peer audio frame to the per-peer playback channel.
+    /// <paramref name="fromUdp"/> tells the jitter buffer which transport
+    /// delivered the frame so it can pick the appropriate target depth
+    /// (smaller for UDP because UDP doesn't have TCP's burst-after-stall
+    /// pattern; larger for the Socket.IO fallback).
+    /// </summary>
+    void AddPlaybackSample(string channelName, WaveInEventArgs sample, bool fromUdp = false);
 
     void ResetAllChannelsVolume(float volume);
     void SetChannelVolume(string channelName, float leftVolume, float rightVolume);

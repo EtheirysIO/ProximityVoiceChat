@@ -82,6 +82,8 @@ public class ConfigWindowPresenter(
 
         Bind(this.view.MasterVolume,
             f => { this.configuration.MasterVolume = f; this.configuration.Save(); }, this.configuration.MasterVolume);
+        Bind(this.view.InputBoost,
+            f => { this.configuration.InputBoost = f; this.configuration.Save(); }, this.configuration.InputBoost);
         Bind(this.view.AudioFalloffType,
             t => { this.configuration.FalloffModel.Type = t; this.configuration.Save(); }, this.configuration.FalloffModel.Type);
         Bind(this.view.AudioFalloffMinimumDistance,
@@ -161,6 +163,7 @@ public class ConfigWindowPresenter(
             this.view.SuppressNoise.Value = true;
             this.view.VadSensitivity.Value = 2;
             this.view.PushToTalk.Value = false;
+            this.view.InputBoost.Value = 1.0f;
 
             this.configuration.PushToTalkBinding = new KeyBinding();
             this.configuration.MuteMicBinding = new KeyBinding();

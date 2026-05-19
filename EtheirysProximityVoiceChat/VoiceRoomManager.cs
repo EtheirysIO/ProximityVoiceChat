@@ -14,7 +14,9 @@
  */
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using AsyncAwaitBestPractices;
 using NAudio.Wave;
@@ -63,6 +65,40 @@ public sealed class VoiceRoomManager : IDisposable
     }
 
     public SignalingChannel? SignalingChannel { get; private set; }
+
+    /// <summary>
+    /// v3 UDP audio transport for the current session, or null when no v3
+    /// session has been established yet (mid-connect, mid-disconnect, or
+    /// the server didn't issue udpCredentials). <see cref="ActiveAudioTransport"/>
+    /// reflects which transport is currently routing send-side audio.
+    /// </summary>
+    internal UdpAudioChannel? UdpAudioChannel { get; private set; }
+
+    public enum AudioTransport
+    {
+        /// <summary>No active session yet (or fully disconnected).</summary>
+        None = 0,
+        /// <summary>Audio uses Socket.IO/WSS — either the user disabled UDP, or UDP is still mid-handshake, or it failed.</summary>
+        Tcp = 1,
+        /// <summary>Audio uses the UDP datagram channel — the v3 happy path.</summary>
+        Udp = 2,
+    }
+
+    /// <summary>
+    /// Which transport <see cref="SendAudioFrameToServer"/> is currently
+    /// using. Updated automatically when the UDP hello completes or fails.
+    /// Surfaced in the ConfigWindow's "Audio transport: …" status line so
+    /// users and bug reports can see what's actually in flight.
+    /// </summary>
+    public AudioTransport ActiveAudioTransport { get; private set; } = AudioTransport.None;
+
+    /// <summary>
+    /// Optional reason string explaining why <see cref="ActiveAudioTransport"/>
+    /// is <see cref="AudioTransport.Tcp"/> rather than UDP — for example
+    /// <c>"hello-ack-timeout"</c> or <c>"user-disabled"</c>. Surfaced in the
+    /// UI status line and in the per-session info log line for diagnostics.
+    /// </summary>
+    public string? AudioTransportReason { get; private set; }
     public PeerPresenceManager? Presence { get; private set; }
 
     public Dictionary<string, TrackedPlayer> TrackedPlayers { get; } = [];
@@ -79,6 +115,33 @@ public sealed class VoiceRoomManager : IDisposable
     public Dictionary<string, bool> GloballyMutedPeers { get; } = new(StringComparer.Ordinal);
 
     private const string PeerType = "player";
+
+    // Auto-reconnect: when the socket drops while the user still wants to be
+    // in a room, we retry the original join up to ReconnectMaxAttempts times
+    // with ReconnectDelay between attempts. The last* fields cache the params
+    // of the most recent JoinVoiceRoom call so the retry loop can replay them
+    // without depending on the (possibly disposed) SignalingChannel for state.
+    private const int ReconnectMaxAttempts = 5;
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+
+    private CancellationTokenSource? reconnectCts;
+    private string? lastRoomName;
+    private string? lastRoomPassword;
+    private string[]? lastPlayersInInstance;
+
+    /// <summary>True while a reconnect retry loop is in flight.</summary>
+    public bool IsReconnecting { get; private set; }
+    /// <summary>1..<see cref="ReconnectMaxAttempts"/> while <see cref="IsReconnecting"/> is true. 0 otherwise.</summary>
+    public int ReconnectAttempt { get; private set; }
+
+    /// <summary>
+    /// Tracks whether the current session was started via
+    /// <see cref="JoinPublicVoiceRoom"/> (true) or
+    /// <see cref="JoinPrivateVoiceRoom"/> (false). Used at <see cref="Dispose"/>
+    /// to decide which kind of resume to write into the Configuration so the
+    /// next plugin load can call the matching join entry point.
+    /// </summary>
+    private bool currentSessionIsPublic;
 
     private string? localPlayerFullName;
     private OpusCodec? opusCodec;
@@ -117,10 +180,21 @@ public sealed class VoiceRoomManager : IDisposable
         this.roomSelfLeaveSound = new(this.dalamud.PluginInterface.GetResourcePath("self_leave.wav"));
 
         this.dalamud.ClientState.Logout += OnLogout;
+
+        // After all wiring is set up, check whether the previous plugin
+        // instance left a resume marker for this same game process.
+        TryResumeFromLastSession();
     }
 
     public void Dispose()
     {
+        // Capture resume state BEFORE the explicit-leave path clears intent.
+        // Persists to Configuration if the user wants to be in a room when the
+        // plugin shuts down (e.g. hot-update). The next plugin load reads this
+        // and rejoins automatically — but only if the OS process fingerprint
+        // still matches, so a full game restart starts clean.
+        PersistResumeState();
+
         // Drive a graceful disconnect first so the signaling server sees us leave
         // immediately and pushes a "close" message to remaining peers. Without
         // this, the socket dies abruptly and other peers see us "ghost" until
@@ -151,6 +225,153 @@ public sealed class VoiceRoomManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Write a resume marker into <see cref="Configuration"/> if the user
+    /// still <em>wants</em> to be in a room at shutdown — covers both
+    /// connected sessions and ones that were mid-reconnect. The marker
+    /// includes the current OS process fingerprint; on the next plugin load,
+    /// <see cref="TryResumeFromLastSession"/> only rejoins when that
+    /// fingerprint still matches (i.e. the game wasn't restarted).
+    /// </summary>
+    private void PersistResumeState()
+    {
+        try
+        {
+            if (this.ShouldBeInRoom)
+            {
+                var (pid, startTicks) = GetCurrentProcessFingerprint();
+                this.configuration.ResumeRoomKind = this.currentSessionIsPublic ? "public" : "private";
+                // Public rooms re-derive the room name from the current map on
+                // rejoin, so we only persist room name + password for private.
+                this.configuration.ResumeRoomName = this.currentSessionIsPublic
+                    ? string.Empty
+                    : (this.lastRoomName ?? string.Empty);
+                this.configuration.ResumeRoomPassword = this.currentSessionIsPublic
+                    ? string.Empty
+                    : (this.lastRoomPassword ?? string.Empty);
+                this.configuration.ResumeProcessId = pid;
+                this.configuration.ResumeProcessStartTimeTicks = startTicks;
+            }
+            else
+            {
+                // No active intent — make sure any leftover marker from an
+                // earlier session is cleared, so we don't auto-rejoin after the
+                // user explicitly left.
+                ClearResumeState();
+            }
+            this.configuration.Save();
+        }
+        catch (Exception ex)
+        {
+            // Never let resume-state persistence block plugin shutdown.
+            try { this.logger.Error("Failed to persist resume state: {0}", ex); } catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>
+    /// Reads a resume marker (if any) left by the previous plugin instance,
+    /// validates the OS process fingerprint, and on a match schedules a
+    /// rejoin via the existing public/private entry points. Always clears
+    /// the marker after reading so a saved password lives on disk for at
+    /// most one plugin lifecycle, and so a stale marker from an unrelated
+    /// game launch is discarded the first time the plugin loads under it.
+    /// </summary>
+    private void TryResumeFromLastSession()
+    {
+        var kind = this.configuration.ResumeRoomKind;
+        var savedPid = this.configuration.ResumeProcessId;
+        var savedStartTicks = this.configuration.ResumeProcessStartTimeTicks;
+        var savedRoomName = this.configuration.ResumeRoomName;
+        var savedRoomPassword = this.configuration.ResumeRoomPassword;
+
+        // Clear-on-read, regardless of whether we end up using the data.
+        ClearResumeState();
+        this.configuration.Save();
+
+        if (string.IsNullOrEmpty(kind)) return;
+
+        var (curPid, curStartTicks) = GetCurrentProcessFingerprint();
+        if (savedPid != curPid || savedStartTicks != curStartTicks)
+        {
+            this.logger.Info(
+                "Skipping voice-room resume: game process changed (saved pid={0} start={1}, current pid={2} start={3}).",
+                savedPid, savedStartTicks, curPid, curStartTicks);
+            return;
+        }
+
+        this.logger.Info("Resuming previous voice session (kind={0}) after plugin reload.", kind);
+
+        // The join entry points need PlayerState populated. If the player is
+        // already in-game, give Dalamud a beat to fully initialize after the
+        // plugin reload (matches ReconnectToCurrentMapPublicRoom's pattern).
+        // If not logged in yet (plugin reloaded at title screen), wait for the
+        // Login event and fire then.
+        void DoJoin()
+        {
+            try
+            {
+                if (kind == "public") JoinPublicVoiceRoom();
+                else if (kind == "private") JoinPrivateVoiceRoom(savedRoomName, savedRoomPassword);
+            }
+            catch (Exception ex) { this.logger.Error(ex.ToString()); }
+        }
+
+        if (this.dalamud.ClientState.IsLoggedIn)
+        {
+            Task.Run(async () =>
+            {
+                await Task.Delay(1000).ConfigureAwait(false);
+                await this.dalamud.Framework.Run(DoJoin).ConfigureAwait(false);
+            }).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+        }
+        else
+        {
+            // One-shot Login subscription: detach inside the handler so a
+            // later normal login doesn't re-fire the resume.
+            void OnLoginOnce()
+            {
+                this.dalamud.ClientState.Login -= OnLoginOnce;
+                Task.Run(async () =>
+                {
+                    await Task.Delay(1000).ConfigureAwait(false);
+                    await this.dalamud.Framework.Run(DoJoin).ConfigureAwait(false);
+                }).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+            }
+            this.dalamud.ClientState.Login += OnLoginOnce;
+        }
+    }
+
+    private void ClearResumeState()
+    {
+        this.configuration.ResumeRoomKind = string.Empty;
+        this.configuration.ResumeRoomName = string.Empty;
+        this.configuration.ResumeRoomPassword = string.Empty;
+        this.configuration.ResumeProcessId = 0;
+        this.configuration.ResumeProcessStartTimeTicks = 0;
+    }
+
+    /// <summary>
+    /// Returns <c>(processId, startTimeUtcTicks)</c> for the running game
+    /// process. The start-time component defeats PID recycling across OS
+    /// reboots — two different game launches can share the same PID but not
+    /// the same start time.
+    /// </summary>
+    private static (long processId, long startTimeUtcTicks) GetCurrentProcessFingerprint()
+    {
+        try
+        {
+            using var proc = Process.GetCurrentProcess();
+            return (proc.Id, proc.StartTime.ToUniversalTime().Ticks);
+        }
+        catch
+        {
+            // If for any reason we can't read process info, fall back to
+            // sentinel values that will never match a saved fingerprint and
+            // therefore safely suppress the resume.
+            return (0, 0);
+        }
+    }
+
     public void JoinPublicVoiceRoom()
     {
         if (this.ShouldBeInRoom)
@@ -158,6 +379,8 @@ public sealed class VoiceRoomManager : IDisposable
             this.logger.Error("Already should be in voice room, ignoring public room join request.");
             return;
         }
+        // Flag the session kind so Dispose can write the right resume entry.
+        this.currentSessionIsPublic = true;
         string roomName = this.mapManager.GetCurrentMapPublicRoomName();
         string[]? otherPlayers = this.mapManager.InSharedWorldMap() ? null : GetOtherPlayerNamesInInstance().ToArray();
         JoinVoiceRoom(roomName, string.Empty, otherPlayers);
@@ -171,6 +394,7 @@ public sealed class VoiceRoomManager : IDisposable
             this.logger.Error("Already should be in voice room, ignoring private room join request.");
             return;
         }
+        this.currentSessionIsPublic = false;
         JoinVoiceRoom(roomName, roomPassword, null);
     }
 
@@ -178,6 +402,15 @@ public sealed class VoiceRoomManager : IDisposable
     {
         if (!autoRejoin)
         {
+            // Explicit leave (Leave button, logout, or final give-up after a
+            // failed retry loop). Cancel any in-flight reconnect and discard
+            // the cached join params so an immediate involuntary disconnect
+            // can't replay them.
+            CancelReconnect();
+            this.lastRoomName = null;
+            this.lastRoomPassword = null;
+            this.lastPlayersInInstance = null;
+
             this.ShouldBeInRoom = false;
             this.mapManager.OnMapChanged -= ReconnectToCurrentMapPublicRoom;
         }
@@ -202,8 +435,23 @@ public sealed class VoiceRoomManager : IDisposable
         this.audioDeviceController.OnAudioRecordingSourceDataAvailable -= SendAudioFrameToServer;
         if (this.SignalingChannel != null)
         {
-            this.SignalingChannel.OnAudioFrame -= OnAudioFrameReceived;
+            this.SignalingChannel.OnAudioFrame -= OnAudioFrameReceivedTcp;
+            this.SignalingChannel.OnUdpCredentialsReceived -= OnUdpCredentialsReceived;
         }
+        // Tear down the v3 UDP channel for this session. Detach the audio
+        // event first so a stale in-flight datagram can't fire into a
+        // disposed pipeline.
+        if (this.UdpAudioChannel != null)
+        {
+            try { this.UdpAudioChannel.OnAudioFrame -= OnAudioFrameReceivedUdp; } catch { /* nothing to do */ }
+            try { this.UdpAudioChannel.Dispose(); } catch (Exception ex) { this.logger.Debug("UDP channel dispose threw: {0}", ex.Message); }
+            this.UdpAudioChannel = null;
+        }
+        ActiveAudioTransport = AudioTransport.None;
+        AudioTransportReason = null;
+        // Drop per-peer seq tracking — a peer who rejoins next session will
+        // start fresh from their first new packet's seq.
+        this.lastUdpSenderSeqByPeer.Clear();
         this.opusCodec?.Dispose();
         this.opusCodec = null;
 
@@ -234,7 +482,7 @@ public sealed class VoiceRoomManager : IDisposable
             this.SignalingChannel.OnConnected -= OnSignalingServerConnected;
             this.SignalingChannel.OnReady -= OnSignalingServerReady;
             this.SignalingChannel.OnDisconnected -= OnSignalingServerDisconnected;
-            this.SignalingChannel.OnErrored -= OnSignalingServerDisconnected;
+            this.SignalingChannel.OnErrored -= OnSignalingServerErrored;
             this.SignalingChannel.OnPremiumStatus -= OnPremiumStatusReceived;
             this.SignalingChannel.OnAdminStatus -= OnAdminStatusReceived;
             this.SignalingChannel.OnMuteState -= OnMuteStateReceived;
@@ -301,6 +549,13 @@ public sealed class VoiceRoomManager : IDisposable
             this.logger.Error("Already in voice room, ignoring join request.");
             return;
         }
+
+        // Cache the join params so the auto-reconnect loop (HandleInvoluntaryDrop
+        // → ScheduleReconnect) can replay this exact join after a socket drop.
+        // Cleared in LeaveVoiceRoom(false) so explicit leaves can't be replayed.
+        this.lastRoomName = roomName;
+        this.lastRoomPassword = roomPassword;
+        this.lastPlayersInInstance = playersInInstance;
 
         this.logger.Debug("Attempting to join voice room.");
 
@@ -392,14 +647,123 @@ public sealed class VoiceRoomManager : IDisposable
         // Fresh codec per room session — Opus encoder/decoder state must start clean.
         this.opusCodec?.Dispose();
         this.opusCodec = new OpusCodec(this.logger);
+
+        // Defensive subscribe pattern (-= then +=) to guarantee exactly-one
+        // subscription regardless of how many times this handler fires. Without
+        // this guard, a race between the SocketIOClient library's own auto-
+        // reconnect (Reconnection=true in SignalingChannel) and our
+        // ScheduleReconnect loop can let OnSignalingServerConnected run twice
+        // before LeaveVoiceRoom(autoRejoin: true) has had a chance to
+        // unsubscribe — and a double-subscribed SendAudioFrameToServer
+        // transmits each captured 20 ms frame twice on the wire, which is
+        // exactly the "peer hears me twice + robotic" symptom (the receiver
+        // decodes two sequential frames with identical PCM and the Opus
+        // encoder's stateful predictor fights itself between them). C#'s
+        // event API treats -= on an unsubscribed handler as a no-op, so this
+        // is safe on the first connect too.
+        this.audioDeviceController.OnAudioRecordingSourceDataAvailable -= SendAudioFrameToServer;
         this.audioDeviceController.OnAudioRecordingSourceDataAvailable += SendAudioFrameToServer;
         if (this.SignalingChannel != null)
         {
-            this.SignalingChannel.OnAudioFrame += OnAudioFrameReceived;
+            this.SignalingChannel.OnAudioFrame -= OnAudioFrameReceivedTcp;
+            this.SignalingChannel.OnAudioFrame += OnAudioFrameReceivedTcp;
+            // v3: subscribe to the server's UDP credentials emission so we
+            // can stand up the UDP audio channel after `ready` completes.
+            // Same defensive -= / += pattern: this handler can fire on every
+            // (re)connect and we must not stack handlers across sessions.
+            this.SignalingChannel.OnUdpCredentialsReceived -= OnUdpCredentialsReceived;
+            this.SignalingChannel.OnUdpCredentialsReceived += OnUdpCredentialsReceived;
         }
+
+        // Start every session with transport state cleared. We default to
+        // TCP — UDP will flip us over if/when the hello-handshake succeeds.
+        ActiveAudioTransport = AudioTransport.Tcp;
+        AudioTransportReason = "udp-not-yet-attempted";
+
         if (this.configuration.PlayRoomJoinAndLeaveSounds)
         {
             this.audioDeviceController.PlaySfx(this.roomJoinSound);
+        }
+    }
+
+    /// <summary>
+    /// Server delivered the per-session UDP credentials. Stand up the UDP
+    /// audio channel and try the hello-handshake. On success, flip the
+    /// send-side transport to UDP; on failure (timeout, network blocked),
+    /// stay on the Socket.IO fallback that's already wired.
+    /// </summary>
+    private void OnUdpCredentialsReceived(UdpCredentials creds)
+    {
+        try
+        {
+            if (!this.configuration.PreferUdpAudio)
+            {
+                this.logger.Info("UDP audio disabled by user preference; staying on Socket.IO transport.");
+                ActiveAudioTransport = AudioTransport.Tcp;
+                AudioTransportReason = "user-disabled";
+                return;
+            }
+
+            // Tear down any prior channel from a previous session before
+            // creating a fresh one. Idempotent on the happy path.
+            try { this.UdpAudioChannel?.Dispose(); } catch { /* nothing to do */ }
+            this.UdpAudioChannel = null;
+
+            UdpAudioChannel channel;
+            try
+            {
+                channel = new UdpAudioChannel(creds, this.logger);
+            }
+            catch (Exception ex)
+            {
+                this.logger.Error("UDP channel construct failed: {0}", ex.Message);
+                ActiveAudioTransport = AudioTransport.Tcp;
+                AudioTransportReason = "construct-failed";
+                return;
+            }
+
+            channel.OnAudioFrame += OnAudioFrameReceivedUdp;
+            this.UdpAudioChannel = channel;
+
+            // Run StartAsync in the background; the hello-handshake completes
+            // in milliseconds on the happy path, up to HelloTimeoutMs on
+            // failure. Audio is allowed to flow over TCP in the meantime.
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await channel.StartAsync().ConfigureAwait(false);
+                    if (channel.Ready)
+                    {
+                        ActiveAudioTransport = AudioTransport.Udp;
+                        AudioTransportReason = null;
+                        this.logger.Info("Audio transport: UDP (session={0})", creds.SessionIdHex);
+                    }
+                    else
+                    {
+                        var reason = channel.LastError is TimeoutException ? "hello-ack-timeout" : "udp-error";
+                        ActiveAudioTransport = AudioTransport.Tcp;
+                        AudioTransportReason = reason;
+                        this.logger.Info("Audio transport: TCP fallback (reason={0})", reason);
+                        // Tear down the dead UDP channel so subsequent
+                        // session restarts don't see a stale one.
+                        try { channel.Dispose(); } catch { /* nothing to do */ }
+                        if (ReferenceEquals(this.UdpAudioChannel, channel)) this.UdpAudioChannel = null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error("UDP channel StartAsync threw: {0}", ex);
+                    ActiveAudioTransport = AudioTransport.Tcp;
+                    AudioTransportReason = "exception";
+                    try { channel.Dispose(); } catch { /* nothing to do */ }
+                    if (ReferenceEquals(this.UdpAudioChannel, channel)) this.UdpAudioChannel = null;
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            this.logger.Error("OnUdpCredentialsReceived failed: {0}", ex);
         }
     }
 
@@ -450,16 +814,123 @@ public sealed class VoiceRoomManager : IDisposable
         }
     }
 
-    private void OnSignalingServerDisconnected()
-    {
-        LeaveVoiceRoom(false).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
-    }
+    private void OnSignalingServerDisconnected() => HandleInvoluntaryDrop();
 
     private void OnSignalingServerErrored()
     {
-        LeaveVoiceRoom(false).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+        // Errored sockets can't be reused — drop the SignalingChannel entirely
+        // so the retry loop builds a fresh one on the next JoinVoiceRoom call.
         this.SignalingChannel?.Dispose();
         this.SignalingChannel = null;
+        HandleInvoluntaryDrop();
+    }
+
+    /// <summary>
+    /// Called when the socket dropped on its own (not via the user's Leave
+    /// button or a logout). If the user still wants to be in a room, schedule
+    /// up to <see cref="ReconnectMaxAttempts"/> retries spaced
+    /// <see cref="ReconnectDelay"/> apart. Otherwise fall back to a normal
+    /// teardown.
+    /// </summary>
+    private void HandleInvoluntaryDrop()
+    {
+        // A retry loop is already in flight — let it own the recovery. Without
+        // this guard, every failed mid-loop connect would restart the counter
+        // and we'd never give up.
+        if (this.IsReconnecting) return;
+
+        if (!this.ShouldBeInRoom || this.lastRoomName == null)
+        {
+            LeaveVoiceRoom(false).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+            return;
+        }
+
+        ScheduleReconnect();
+    }
+
+    private void ScheduleReconnect()
+    {
+        CancelReconnect();
+        var cts = new CancellationTokenSource();
+        this.reconnectCts = cts;
+        this.IsReconnecting = true;
+        this.ReconnectAttempt = 0;
+
+        var roomName = this.lastRoomName;
+        var roomPassword = this.lastRoomPassword ?? string.Empty;
+        var players = this.lastPlayersInInstance;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                for (int i = 1; i <= ReconnectMaxAttempts; i++)
+                {
+                    if (cts.IsCancellationRequested) return;
+                    this.ReconnectAttempt = i;
+                    this.logger.Info("Signaling reconnect attempt {0}/{1}", i, ReconnectMaxAttempts);
+
+                    // Tear the prior session down without dropping ShouldBeInRoom.
+                    // Necessary on both the initial drop and between failed attempts:
+                    // JoinVoiceRoom refuses to run while InRoom == true.
+                    await LeaveVoiceRoom(autoRejoin: true).ConfigureAwait(false);
+                    if (cts.IsCancellationRequested) return;
+
+                    // JoinVoiceRoom must run on the main thread because it touches
+                    // Dalamud's PlayerState (player name lookup). Matches the
+                    // pattern used by ReconnectToCurrentMapPublicRoom.
+                    await this.dalamud.Framework.Run(() =>
+                    {
+                        if (cts.IsCancellationRequested) return;
+                        if (roomName == null) return;
+                        JoinVoiceRoom(roomName, roomPassword, players);
+                    }).ConfigureAwait(false);
+
+                    // Wait the retry interval to see whether OnConnected fires.
+                    // If the socket comes up in this window, we're done; otherwise
+                    // the next iteration tears down and tries again.
+                    try { await Task.Delay(ReconnectDelay, cts.Token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { return; }
+
+                    if (this.SignalingChannel?.Connected == true)
+                    {
+                        this.logger.Info("Signaling reconnect succeeded on attempt {0}", i);
+                        return;
+                    }
+                }
+
+                // All attempts failed — give up and fall through to a normal leave
+                // so ShouldBeInRoom clears and the UI returns to "Not connected".
+                this.logger.Warn("Signaling reconnect gave up after {0} attempts", ReconnectMaxAttempts);
+                await LeaveVoiceRoom(autoRejoin: false).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) { /* user left or logged out — silent */ }
+            catch (Exception ex)
+            {
+                this.logger.Error(ex.ToString());
+            }
+            finally
+            {
+                ClearReconnectState();
+            }
+        });
+    }
+
+    private void CancelReconnect()
+    {
+        try
+        {
+            this.reconnectCts?.Cancel();
+            this.reconnectCts?.Dispose();
+        }
+        catch { /* nothing to do */ }
+        this.reconnectCts = null;
+    }
+
+    private void ClearReconnectState()
+    {
+        this.IsReconnecting = false;
+        this.ReconnectAttempt = 0;
     }
 
     /// <summary>
@@ -493,8 +964,12 @@ public sealed class VoiceRoomManager : IDisposable
     }
 
     /// <summary>
-    /// v2 audio send path: encode one captured 20 ms PCM frame as Opus and emit it
-    /// to the signaling server, which fans it out to every other peer in the room.
+    /// Audio send path: encode one captured 20 ms PCM frame as Opus and
+    /// emit it to the signaling server, which fans it out to every other
+    /// peer in the room. Routes via UDP when the v3 channel is ready;
+    /// falls back to Socket.IO otherwise. Both transports converge at the
+    /// server — peers receive on whichever transport the server picks for
+    /// them, so the sender's choice is independent of the receivers'.
     /// </summary>
     private void SendAudioFrameToServer(object? sender, WaveInEventArgs e)
     {
@@ -511,8 +986,19 @@ public sealed class VoiceRoomManager : IDisposable
                 return;
             }
 
-            this.SignalingChannel.EmitAudioAsync(packet)
-                .SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+            // Prefer UDP when the v3 channel is up. Send is fire-and-forget
+            // on both paths so a slow socket can't backpressure the capture
+            // thread; the UDP path drops on EWOULDBLOCK rather than queueing.
+            var udp = this.UdpAudioChannel;
+            if (udp != null && udp.Ready)
+            {
+                udp.SendAudioFrame(packet);
+            }
+            else
+            {
+                this.SignalingChannel.EmitAudioAsync(packet)
+                    .SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+            }
         }
         catch (Exception ex)
         {
@@ -521,37 +1007,114 @@ public sealed class VoiceRoomManager : IDisposable
     }
 
     /// <summary>
-    /// v2 audio receive path: server delivered an Opus packet from another player.
-    /// Decode and hand to the per-peer playback channel.
+    /// Per-peer last seen sender sequence number. UDP path only — the
+    /// Socket.IO transport doesn't carry sender sequence numbers so we
+    /// can't detect gaps there (and TCP doesn't lose packets anyway). On
+    /// a one-frame gap we use Opus FEC to recover the missing frame; on
+    /// reorder / duplicate we just drop the late-arriving packet.
     /// </summary>
-    private void OnAudioFrameReceived(string fromPeerId, byte[] opusPacket)
+    private readonly Dictionary<string, uint> lastUdpSenderSeqByPeer = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Audio receive path called for frames that arrived on the Socket.IO
+    /// transport. Tags the frame as TCP-delivered for the jitter buffer's
+    /// adaptive depth. No FEC recovery (no sender-seq available, and TCP
+    /// guarantees ordered delivery so gaps don't exist).
+    /// </summary>
+    private void OnAudioFrameReceivedTcp(string fromPeerId, byte[] opusPacket)
+    {
+        if (!TryValidateAudioSender(fromPeerId)) return;
+        DecodeAndPlay(fromPeerId, opusPacket, recoverPreviousViaFec: false, fromUdp: false);
+    }
+
+    /// <summary>
+    /// Audio receive path called for frames that arrived on the UDP
+    /// transport (decrypted + framing-validated upstream in
+    /// <see cref="UdpAudioChannel"/>). Uses <paramref name="senderSeq"/>
+    /// to detect one-frame gaps and recover the missing frame via Opus
+    /// FEC before decoding the current one.
+    /// </summary>
+    private void OnAudioFrameReceivedUdp(string fromPeerId, uint senderSeq, byte[] opusPacket)
+    {
+        if (!TryValidateAudioSender(fromPeerId)) return;
+
+        // Per-peer seq tracking. On the first packet from a peer the dict
+        // entry doesn't exist; treat that as no gap (just record the seq).
+        bool recoverPreviousViaFec = false;
+        if (this.lastUdpSenderSeqByPeer.TryGetValue(fromPeerId, out var lastSeq))
+        {
+            // Wrap-safe comparison: subtract as int32. If the new seq is
+            // <= lastSeq (delta ≤ 0), drop as reorder / duplicate.
+            var delta = (int)(senderSeq - lastSeq);
+            if (delta <= 0) return;
+            if (delta == 2) recoverPreviousViaFec = true;        // exactly one missing
+            // delta > 2: more than one frame lost. FEC can only recover the
+            // immediately-previous frame; older missing frames are gone.
+            // Still try FEC for the most recent missing one.
+            else if (delta > 2) recoverPreviousViaFec = true;
+        }
+        this.lastUdpSenderSeqByPeer[fromPeerId] = senderSeq;
+
+        DecodeAndPlay(fromPeerId, opusPacket, recoverPreviousViaFec, fromUdp: true);
+    }
+
+    /// <summary>
+    /// Defense-in-depth: reject frames from peerIds the server hasn't
+    /// announced. A malicious in-room peer can spoof `from` in audio
+    /// emits (server pins it to its socket-bound peerId, but that
+    /// peerId could still be valid-yet-unexpected — e.g. a peer left
+    /// and an attacker rejoined under their name). Without this gate
+    /// the plugin would auto-create a playback channel for any string,
+    /// unbounded.
+    /// </summary>
+    private bool TryValidateAudioSender(string fromPeerId)
+    {
+        var isTrustedAdminAudio = IsTrustedAdminAudioPeerId(fromPeerId);
+        if (isTrustedAdminAudio) return true;
+        if (!PeerPresenceManager.IsValidPeerId(fromPeerId)) return false;
+        if (this.Presence == null || !this.Presence.IsKnownPeer(fromPeerId)) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// Decode (with optional FEC recovery of the prior frame) and hand
+    /// the resulting PCM to the per-peer playback channel.
+    /// </summary>
+    private void DecodeAndPlay(string fromPeerId, byte[] opusPacket, bool recoverPreviousViaFec, bool fromUdp)
     {
         try
         {
             if (this.opusCodec == null) return;
 
-            // Defense-in-depth: reject frames from peerIds the server hasn't
-            // announced. A malicious in-room peer can spoof `from` in audio
-            // emits (server pins it to its socket-bound peerId, but that
-            // peerId could still be valid-yet-unexpected — e.g. a peer left
-            // and an attacker rejoined under their name). Without this gate
-            // the plugin would auto-create a playback channel for any string,
-            // unbounded.
-            var isTrustedAdminAudio = IsTrustedAdminAudioPeerId(fromPeerId);
-            if (!isTrustedAdminAudio)
+            // Lazily ensure the playback channel exists. Membership has
+            // already been verified upstream.
+            this.audioDeviceController.CreateAudioPlaybackChannel(fromPeerId);
+
+            // FEC recovery: when there's a detected one-or-more frame gap,
+            // pull the redundant copy of the immediately-prior frame out of
+            // this packet's FEC bits. Emit it BEFORE the current frame so
+            // playback ordering matches the wall-clock ordering of the
+            // sender's mic. If the FEC payload is absent (encoder didn't
+            // include one) the recovery returns null and we just play the
+            // current frame normally.
+            if (recoverPreviousViaFec)
             {
-                if (!PeerPresenceManager.IsValidPeerId(fromPeerId)) return;
-                if (this.Presence == null || !this.Presence.IsKnownPeer(fromPeerId)) return;
+                var recovered = this.opusCodec.DecodeFecRecovered(fromPeerId, opusPacket);
+                if (recovered != null)
+                {
+                    this.audioDeviceController.AddPlaybackSample(
+                        fromPeerId,
+                        new WaveInEventArgs(recovered, recovered.Length),
+                        fromUdp);
+                }
             }
 
             var pcm = this.opusCodec.Decode(fromPeerId, opusPacket);
             if (pcm == null) return;
-
-            // Lazily ensure the playback channel exists. Membership has
-            // already been verified above, so this only creates channels for
-            // peers the server told us about.
-            this.audioDeviceController.CreateAudioPlaybackChannel(fromPeerId);
-            this.audioDeviceController.AddPlaybackSample(fromPeerId, new WaveInEventArgs(pcm, pcm.Length));
+            this.audioDeviceController.AddPlaybackSample(
+                fromPeerId,
+                new WaveInEventArgs(pcm, pcm.Length),
+                fromUdp);
         }
         catch (Exception ex)
         {

@@ -123,6 +123,17 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     private bool editingStatus = false;
     private string statusEditBuffer = string.Empty;
 
+    /// <summary>
+    /// Window-relative X (in points) where the channel name's first glyph is
+    /// drawn in <see cref="DrawVoiceChannel"/>. Captured each frame the channel
+    /// row renders, then reused by <see cref="DrawPeerRow"/> to align the
+    /// voice-activity dot with the same X — so the dot lines up under the "L"
+    /// of "Limsa…", and the gap between dot and name matches the gap between
+    /// the speaker icon and the channel name. Initialised to a sensible
+    /// fallback in case a peer row ever draws before the channel row.
+    /// </summary>
+    private float channelNameAlignX = 28f;
+
     private readonly string windowName;
 
     public MainWindow(
@@ -293,7 +304,7 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         if (this.openKickModalRequested)
         {
             this.openKickModalRequested = false;
-            ImGui.OpenPopup("kicked-by-admin-modal");
+            ImGui.OpenPopup("You have been kicked##kicked-by-admin-modal");
         }
 
         // Push footer to the bottom of the window
@@ -366,6 +377,9 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
             ImGui.TextColored(inRoom ? Vector4Colors.Green : Vector4Colors.Gray, icon);
         }
         ImGui.SameLine();
+        // Capture where the channel name's first glyph lands — this is the
+        // X-coordinate that DrawPeerRow uses to align each peer's voice dot.
+        this.channelNameAlignX = ImGui.GetCursorPosX();
         var countLabel = count > 0 ? $" ({count})" : string.Empty;
         ImGui.Text($"{channelName}{countLabel}");
         if (ImGui.IsItemClicked() && !inRoom && !connecting)
@@ -397,12 +411,16 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
 
         if (rosterMaterialized.Count > 0)
         {
-            ImGui.Indent(20);
+            // Peer rows used to live inside ImGui.Indent(20), which left the
+            // voice dot to the left of the "L" in the channel name and a
+            // wider-than-expected gap before the player name. Each peer row
+            // now positions its own cursor via this.channelNameAlignX so the
+            // dot lines up exactly under the channel name and the dot→name
+            // gap mirrors the speaker-icon→channel-name gap.
             foreach (var (user, index) in rosterMaterialized.Select((u, i) => (u, i)))
             {
                 DrawPeerRow(user, index);
             }
-            ImGui.Unindent(20);
             ImGui.Dummy(new Vector2(0, 2));
         }
 
@@ -487,14 +505,26 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         // pairing.
         var profileColor = Vector4Colors.HexToVector4(peerProfile?.Color ?? "FFFFFF");
 
-        // Distance-aware speaking indicator bars.
+        // Distance-aware voice-activity dot. Replaces the older 3-bar signal
+        // indicator: a single green circle whose brightness fades with distance
+        // (full bright at 0y, invisible past FalloffModel.MaximumDistance). The
+        // dot is only drawn while the peer is actually speaking — silence and
+        // out-of-range both render as empty space.
+        //
+        // The dot's slot is positioned at channelNameAlignX (captured in
+        // DrawVoiceChannel) so its left edge sits directly under the channel
+        // name's first glyph. The slot width matches the dot size exactly
+        // (no extra padding) so the subsequent ImGui.SameLine() leaves only
+        // the default ItemSpacing.X gap before the player name — mirroring
+        // the speaker-icon → channel-name gap.
+        ImGui.SetCursorPosX(this.channelNameAlignX);
         var cursorPos = ImGui.GetCursorScreenPos();
         var indicatorSize = new Vector2(14f, 12f);
         var indicatorPos = cursorPos + new Vector2(1f, MathF.Max(0f, (ImGui.GetTextLineHeight() - indicatorSize.Y) * 0.5f));
-        var litBars = GetSignalBarsToLight(isSelf, isSpeaking, distance);
+        var intensity = GetVoiceDotIntensity(isSelf, isSpeaking, distance);
         var drawList = ImGui.GetWindowDrawList();
-        DrawSignalBars(drawList, indicatorPos, indicatorSize, litBars);
-        ImGui.Dummy(new Vector2(indicatorSize.X + 6f, 0));
+        DrawVoiceDot(drawList, indicatorPos, indicatorSize, intensity);
+        ImGui.Dummy(new Vector2(indicatorSize.X, 0));
         ImGui.SameLine();
 
         // Player label. Honors the "Show full player names" toggle to match
@@ -506,6 +536,10 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         var fullLabel = $"{rawName}{distStr}";
 
         ImGui.TextColored(profileColor, fullLabel);
+        // ShowProfileFeature is a compile-time const false (see ConfigWindow.cs
+        // for the rationale) → the if-body folds away. Suppress CS0162 so the
+        // feature-flag intent stays visible in source.
+#pragma warning disable CS0162
         if (ShowProfileFeature)
         {
             if (ImGui.IsItemHovered())
@@ -523,6 +557,7 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         {
             ImGui.SetTooltip("Right-click for options");
         }
+#pragma warning restore CS0162
 
         // Right-click context menu on a peer row:
         //   • Mute toggle + local volume slider — adjusts how loud the peer
@@ -757,71 +792,56 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         }
     }
 
-    private int GetSignalBarsToLight(bool isSelf, bool isSpeaking, float distance)
+    /// <summary>
+    /// Returns the brightness (0..1) for the per-peer voice-activity dot.
+    /// 0 means "don't draw it at all" — used for silence and for peers past
+    /// <see cref="Configuration.FalloffModel"/>'s <c>MaximumDistance</c>.
+    /// 1 means full green. Brightness falls off linearly with distance so the
+    /// dot visually tracks how audible the peer is. Self / NaN distance always
+    /// render at full intensity when speaking.
+    /// </summary>
+    private float GetVoiceDotIntensity(bool isSelf, bool isSpeaking, float distance)
     {
         if (!isSpeaking)
         {
-            return 0;
+            return 0f;
         }
 
         if (isSelf || float.IsNaN(distance))
         {
-            return 3;
+            return 1f;
         }
 
         var maxDistance = this.configuration.FalloffModel.MaximumDistance;
         if (maxDistance <= 0f)
         {
-            return 3;
+            return 1f;
         }
 
-        var normalizedDistance = distance / maxDistance;
-        if (normalizedDistance >= 1f)
-        {
-            return 0;
-        }
-
-        if (normalizedDistance > 0.75f)
-        {
-            return 1;
-        }
-
-        if (normalizedDistance > 0.50f)
-        {
-            return 2;
-        }
-
-        return 3;
+        // Linear falloff: full bright at 0y, invisible at >= maxDistance.
+        var intensity = 1f - (distance / maxDistance);
+        return Math.Clamp(intensity, 0f, 1f);
     }
 
-    private static void DrawSignalBars(ImDrawListPtr drawList, Vector2 topLeft, Vector2 size, int litBars)
+    /// <summary>
+    /// Draws a green voice-activity dot inside the reserved indicator slot.
+    /// Skips drawing entirely when intensity is 0 so out-of-range / silent
+    /// peers leave a clean empty slot rather than a dim placeholder.
+    /// </summary>
+    private static void DrawVoiceDot(ImDrawListPtr drawList, Vector2 topLeft, Vector2 size, float intensity)
     {
-        var barWidth = 3f;
-        var gap = 2f;
-        var baseY = topLeft.Y + size.Y;
-        var heights = new[] { 4f, 8f, 12f };
+        if (intensity <= 0f) return;
 
-        var active = ImGui.GetColorU32(new Vector4(0.35f, 0.95f, 0.35f, 1f));
-        var inactiveFill = ImGui.GetColorU32(new Vector4(0.25f, 0.27f, 0.30f, 0.55f));
-        var inactiveBorder = ImGui.GetColorU32(new Vector4(0.45f, 0.47f, 0.50f, 0.90f));
+        // Center the dot inside the slot. Radius is sized to leave a 1 px
+        // margin so it never touches the row's bounding box.
+        var center = new Vector2(topLeft.X + size.X * 0.5f, topLeft.Y + size.Y * 0.5f);
+        var radius = MathF.Min(size.X, size.Y) * 0.5f - 1f;
 
-        for (var i = 0; i < 3; i++)
-        {
-            var x1 = topLeft.X + i * (barWidth + gap);
-            var x2 = x1 + barWidth;
-            var y1 = baseY - heights[i];
-            var y2 = baseY;
-
-            if (i < litBars)
-            {
-                drawList.AddRectFilled(new Vector2(x1, y1), new Vector2(x2, y2), active, 0f);
-            }
-            else
-            {
-                drawList.AddRectFilled(new Vector2(x1, y1), new Vector2(x2, y2), inactiveFill, 0f);
-                drawList.AddRect(new Vector2(x1, y1), new Vector2(x2, y2), inactiveBorder, 0f, ImDrawFlags.None, 1f);
-            }
-        }
+        // Color scales both saturation and alpha with intensity so far-away
+        // peers fade out gracefully rather than just becoming transparent
+        // green-on-background.
+        var color = new Vector4(0.35f * intensity, 0.95f * intensity, 0.35f * intensity, intensity);
+        drawList.AddCircleFilled(center, radius, ImGui.ColorConvertFloat4ToU32(color));
     }
 
     private void DrawReportModal()
@@ -911,7 +931,7 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     private void DrawKickedByAdminModal()
     {
         ImGui.SetNextWindowSize(new Vector2(380f, 0f), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal("kicked-by-admin-modal", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoResize))
+        if (ImGui.BeginPopupModal("You have been kicked##kicked-by-admin-modal", ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoResize))
         {
             ImGui.TextColored(new Vector4(0.95f, 0.45f, 0.45f, 1f), "Kicked from voice chat");
             ImGui.Spacing();
@@ -1053,35 +1073,89 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     {
         var inRoom = this.voiceRoomManager.InRoom;
         var connecting = this.voiceRoomManager.SignalingChannel?.Connecting ?? false;
+        var reconnecting = this.voiceRoomManager.IsReconnecting;
+        var reconnectAttempt = this.voiceRoomManager.ReconnectAttempt;
 
-        string status;
-        Vector4 statusColor;
         if (inRoom)
         {
-            status = $"Connected to {GetVoiceChannelDisplayName()}";
-            statusColor = Vector4Colors.Green;
+            // Wi-Fi-style 3-bar strength indicator next to the channel name.
+            // Color + lit count are derived from SignalingChannel.LastLatencyMs.
+            var latency = this.voiceRoomManager.SignalingChannel?.LastLatencyMs;
+            DrawConnectionStrengthBars(latency);
+            ImGui.SameLine();
+            ImGui.TextUnformatted(GetVoiceChannelDisplayName());
+        }
+        else if (reconnecting)
+        {
+            ImGui.TextColored(Vector4Colors.Orange, $"Reconnecting ({reconnectAttempt}/5)...");
         }
         else if (connecting)
         {
-            status = "Connecting...";
-            statusColor = Vector4Colors.Orange;
+            ImGui.TextColored(Vector4Colors.Orange, "Connecting...");
         }
         else
         {
-            status = "Not connected";
-            statusColor = Vector4Colors.Gray;
-        }
-        ImGui.TextColored(statusColor, status);
-        if (inRoom && ImGui.IsItemHovered())
-        {
-            var latency = this.voiceRoomManager.SignalingChannel?.LastLatencyMs;
-            ImGui.SetTooltip(latency.HasValue
-                ? $"Connection latency: {latency.Value} ms"
-                : "Connection latency is still being measured.");
+            ImGui.TextColored(Vector4Colors.Gray, "Not connected");
         }
 
         ImGui.Spacing();
         DrawLocalPlayerIdentity();
+    }
+
+    /// <summary>
+    /// Render a Wi-Fi-style 3-bar connection strength indicator. Latency
+    /// thresholds (tuned for real-time voice):
+    ///   <list type="bullet">
+    ///     <item>&lt; 80 ms → 3 bars lit, green</item>
+    ///     <item>80–199 ms → 2 bars lit, orange</item>
+    ///     <item>≥ 200 ms → 1 bar lit, red</item>
+    ///     <item>no sample yet → all bars dim/gray</item>
+    ///   </list>
+    /// Hover shows the latest median latency in ms — matching the tooltip the
+    /// old "Connected to …" text used to expose.
+    /// </summary>
+    private void DrawConnectionStrengthBars(int? latencyMs)
+    {
+        int lit;
+        Vector4 color;
+        if (!latencyMs.HasValue)        { lit = 0; color = Vector4Colors.Gray; }
+        else if (latencyMs.Value < 80)  { lit = 3; color = Vector4Colors.Green; }
+        else if (latencyMs.Value < 200) { lit = 2; color = Vector4Colors.Orange; }
+        else                            { lit = 1; color = Vector4Colors.Red; }
+
+        // Unlit bars: dark-tinted version of the live color so they read as
+        // "off but related". The all-dim (no-sample) state uses a neutral gray
+        // instead so it doesn't look like a red signal.
+        var dim = lit == 0
+            ? new Vector4(0.35f, 0.35f, 0.35f, 0.6f)
+            : new Vector4(color.X * 0.3f, color.Y * 0.3f, color.Z * 0.3f, 0.6f);
+
+        var dl = ImGui.GetWindowDrawList();
+        var origin = ImGui.GetCursorScreenPos();
+        var lineH = ImGui.GetTextLineHeight();
+        var barW = MathF.Max(2f, lineH * 0.18f);
+        var gap = MathF.Max(1f, lineH * 0.10f);
+        var baseY = origin.Y + lineH;        // bars sit on the text baseline
+
+        for (int i = 0; i < 3; i++)
+        {
+            var h = lineH * (0.35f + 0.30f * i);   // 35%, 65%, 95% of line height
+            var x = origin.X + i * (barW + gap);
+            var c = ImGui.ColorConvertFloat4ToU32(i < lit ? color : dim);
+            dl.AddRectFilled(new Vector2(x, baseY - h), new Vector2(x + barW, baseY), c, 1f);
+        }
+
+        // Reserve layout space so SameLine() lands cleanly after the widget.
+        // Dummy is also the hit-target for the tooltip below.
+        var totalW = 3 * barW + 2 * gap;
+        ImGui.Dummy(new Vector2(totalW, lineH));
+
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(latencyMs.HasValue
+                ? $"Connection latency: {latencyMs.Value} ms"
+                : "Connection latency is still being measured.");
+        }
     }
 
     private void DrawLocalPlayerIdentity()
@@ -1129,8 +1203,11 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         {
             // Draw player name. Profile / status-edit interactions are gated
             // behind ShowProfileFeature so non-premium-era users don't see a
-            // tooltip teasing a feature that doesn't work yet.
+            // tooltip teasing a feature that doesn't work yet. The const-folded
+            // false makes the body unreachable; CS0162 is suppressed so the
+            // feature-flag intent stays visible.
             ImGui.TextColored(profileColor, name);
+#pragma warning disable CS0162
             if (ShowProfileFeature)
             {
                 var localPremium = this.configuration.IsLocalPremium;
@@ -1152,6 +1229,7 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                     this.openProfileModalRequested = true;
                 }
             }
+#pragma warning restore CS0162
 
             ImGui.TextColored(Vector4Colors.Gray, jobLine);
 
