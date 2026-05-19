@@ -126,6 +126,23 @@ public class MainWindowPresenter(
         {
             reactiveProperty.Value = initialValue;
         }
-        reactiveProperty.Subscribe(dataUpdateAction);
+        // ReactiveProperty emits the current value immediately on subscribe.
+        // Skipping that first emission avoids an eager config save during
+        // plugin startup that races Dalamud's storage layer and intermittently
+        // surfaces as "database is locked". Wrap the user-supplied action in
+        // try/catch so a single bad write can't tear down the subscription.
+        reactiveProperty
+            .Skip(1)
+            .Subscribe(value =>
+            {
+                try
+                {
+                    dataUpdateAction(value);
+                }
+                catch (Exception ex)
+                {
+                    this.logger.Error("Failed to persist setting update: {0}", ex);
+                }
+            });
     }
 }

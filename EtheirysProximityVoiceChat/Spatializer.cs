@@ -200,6 +200,18 @@ public sealed class Spatializer : IDisposable
         var minDistance = this.configuration.FalloffModel.MinimumDistance;
         var maxDistance = this.configuration.FalloffModel.MaximumDistance;
         var falloffFactor = this.configuration.FalloffModel.FalloffFactor;
+
+        // Hard cutoff: anyone beyond maxDistance is completely inaudible.
+        // The falloff formulas below clamp distance to maxDistance and
+        // therefore return a small-but-non-zero volume at any range, so
+        // MaximumDistance used to feel like a toy setting. Returning 0 here
+        // makes the slider do what its name says. Pairs with the
+        // "Player out of range" gray-text + tooltip rendered in DrawPeerRow.
+        if (distance > maxDistance)
+        {
+            return 0.0f;
+        }
+
         float volume;
         try
         {
