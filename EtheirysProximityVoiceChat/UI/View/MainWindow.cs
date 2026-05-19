@@ -679,7 +679,13 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                 if (!string.IsNullOrWhiteSpace(actualRoomName)
                     && !actualRoomName.StartsWith("public", StringComparison.Ordinal))
                 {
-                    rowChannelName = actualRoomName;
+                    // v4 private-room keys are "<displayName>@<world>".
+                    // Strip the @world suffix so the user sees just the
+                    // friendly part they typed — matches the convention in
+                    // the browse list. Legacy v3 keys had no '@' so the
+                    // IndexOf check is a no-op for them.
+                    var atIdx = actualRoomName.IndexOf('@');
+                    rowChannelName = atIdx > 0 ? actualRoomName[..atIdx] : actualRoomName;
                 }
             }
 
@@ -779,9 +785,19 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                     case SignalingChannelError.KickedFromChannel:
                     {
                         var roomName = this.voiceRoomManager.SignalingChannel?.RoomName;
-                        var kickedFrom = !string.IsNullOrWhiteSpace(roomName) && !roomName.StartsWith("public", StringComparison.Ordinal)
-                            ? roomName
-                            : GetVoiceChannelDisplayName();
+                        // Strip the v4 "@world" suffix from private-room keys
+                        // so the user-visible message matches what they typed
+                        // when they joined.
+                        string kickedFrom;
+                        if (!string.IsNullOrWhiteSpace(roomName) && !roomName.StartsWith("public", StringComparison.Ordinal))
+                        {
+                            var atIdx = roomName.IndexOf('@');
+                            kickedFrom = atIdx > 0 ? roomName[..atIdx] : roomName;
+                        }
+                        else
+                        {
+                            kickedFrom = GetVoiceChannelDisplayName();
+                        }
                         var kickedMessage = $"You've been kicked from {kickedFrom}.";
                         ImGui.Text($"  {kickedMessage}");
                         break;

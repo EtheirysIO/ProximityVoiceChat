@@ -355,7 +355,29 @@ public sealed class VoiceRoomManager : IDisposable
             try
             {
                 if (kind == "public") JoinPublicVoiceRoom();
-                else if (kind == "private") JoinPrivateVoiceRoom(savedRoomName, savedRoomPassword);
+                else if (kind == "private")
+                {
+                    // v4: private joins need (listed, currentWorld) — read
+                    // listed from the live Configuration toggle, and pull
+                    // the current world from PlayerState. If the world isn't
+                    // available (shouldn't happen post-Login, but defensive),
+                    // skip the resume rather than emit a guaranteed-to-fail
+                    // ready with an empty world.
+                    var listed = !this.configuration.RoomUnlisted;
+                    string? world = null;
+                    try
+                    {
+                        var w = this.dalamud.PlayerState.CurrentWorld;
+                        if (w.IsValid) world = w.Value.Name.ExtractText();
+                    }
+                    catch { /* leave world null below */ }
+                    if (string.IsNullOrWhiteSpace(world))
+                    {
+                        this.logger.Info("Skipping private-room resume: current world is not yet available.");
+                        return;
+                    }
+                    JoinPrivateVoiceRoom(savedRoomName, savedRoomPassword, listed, world);
+                }
             }
             catch (Exception ex) { this.logger.Error(ex.ToString()); }
         }
