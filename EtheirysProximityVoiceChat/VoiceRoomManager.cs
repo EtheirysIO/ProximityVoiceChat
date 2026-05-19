@@ -936,6 +936,23 @@ public sealed class VoiceRoomManager : IDisposable
             return;
         }
 
+        // If the server gave us a structured error code, decide whether it's
+        // worth retrying. The auto-reconnect loop is there for transient
+        // network failures, not for "your room name is banned" / "the room is
+        // full" / "you're banned from this room" — those would re-fail on
+        // every retry with the same parameters and just spam the server while
+        // leaving the plugin's UI stuck in a fake "in-room" state during the
+        // attempts. Treat any *known* error code as permanent and fall
+        // through to a clean leave; only Unknown (or no error at all) is
+        // assumed transient.
+        var latestError = this.SignalingChannel?.LatestError;
+        if (latestError is SignalingChannelError code && code != SignalingChannelError.Unknown)
+        {
+            this.logger.Info("Server rejected the join ({0}); skipping auto-reconnect.", code);
+            LeaveVoiceRoom(false).SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
+            return;
+        }
+
         ScheduleReconnect();
     }
 
