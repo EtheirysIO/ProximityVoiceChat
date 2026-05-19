@@ -820,6 +820,17 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             this.audioRecordingSource.Dispose();
             this.audioRecordingSource = null;
         }
+        // Reset the "recording" flag so the next UpdateSourceStates call sees
+        // "not recording" and re-creates the source. Without this, a mid-
+        // session device switch (which calls DisposeAudioRecordingSource +
+        // UpdateSourceStates back-to-back while still in a room) leaves
+        // recording=true but audioRecordingSource=null — and UpdateSourceStates'
+        // start-branch guard (`if (!this.recording)`) then skips creating the
+        // new recorder, so no DataAvailable events fire and transmission
+        // silently stops. The level meter and pickup indicator look like
+        // they're still working because they read the LAST frame's buffer
+        // and peak — both frozen at the pre-switch state.
+        this.recording = false;
     }
 
     private WaveOutEvent? GetAudioPlaybackSource(bool createIfNull)
@@ -856,6 +867,11 @@ public sealed class AudioDeviceController : IAudioDeviceController, IDisposable
             this.audioPlaybackSource.Dispose();
             this.audioPlaybackSource = null;
         }
+        // Same fix as DisposeAudioRecordingSource: clear the playingBack flag
+        // so UpdateSourceStates re-creates the output device after a mid-
+        // session switch instead of skipping the re-init because it still
+        // thinks playback is running.
+        this.playingBack = false;
     }
 
     private void OnMixerInputEnded(object? sender, SampleProviderEventArgs e)
