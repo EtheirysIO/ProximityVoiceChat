@@ -20,5 +20,13 @@ public enum SignalingChannelError
     IncorrectPrivateRoomPassword = 1,
     NonexistentPrivateRoom = 2,
     KickedFromChannel = 3,
+    /// <summary>v4: room is at the 24-peer cap.</summary>
+    PrivateRoomFull = 4,
+    /// <summary>v4: this peerId is banned from the room.</summary>
+    BannedFromPrivateRoom = 5,
+    /// <summary>v4: room display name was rejected by the server blocklist or length cap.</summary>
+    InvalidPrivateRoomName = 6,
+    /// <summary>v4: caller already owns one room and tried to create another.</summary>
+    AlreadyOwnAnotherRoom = 7,
     UnsupportedOperatingSystem = 10,
 }

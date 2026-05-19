@@ -22,6 +22,7 @@ using System.Numerics;
 using System.Reactive;
 using System.Reactive.Linq;
 using System.Reactive.Subjects;
+using AsyncAwaitBestPractices;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.Utility;
@@ -76,6 +77,13 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     public IReactiveProperty<bool> PublicRoom { get; } = new ReactiveProperty<bool>();
     public IReactiveProperty<string> RoomName { get; } = new ReactiveProperty<string>(string.Empty);
     public IReactiveProperty<string> RoomPassword { get; } = new ReactiveProperty<string>(string.Empty);
+    /// <summary>
+    /// v4 only. When true, the user's room is hidden from the browse list.
+    /// Default false (= listed). Bound to <c>Configuration.RoomUnlisted</c>
+    /// by the presenter so the preference persists across sessions like the
+    /// password does.
+    /// </summary>
+    public IReactiveProperty<bool> RoomUnlisted { get; } = new ReactiveProperty<bool>();
 
     private readonly Subject<Unit> joinVoiceRoom = new();
     public IObservable<Unit> JoinVoiceRoom => joinVoiceRoom.AsObservable();
@@ -98,6 +106,8 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     private readonly MapManager mapChangeHandler;
     private readonly Configuration configuration;
     private readonly ConfigWindow configWindow;
+    private readonly WebRTC.PrivateRoomCatalog roomCatalog;
+    private bool autoRefreshedRoomCatalogOnce;
     private readonly HttpClient httpClient = new();
     private readonly Queue<DateTime> reportTimestampsUtc = new();
 
@@ -143,7 +153,8 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         VoiceRoomManager voiceRoomManager,
         MapManager mapChangeHandler,
         Configuration configuration,
-        ConfigWindow configWindow) : base(PluginInitializer.Name)
+        ConfigWindow configWindow,
+        WebRTC.PrivateRoomCatalog roomCatalog) : base(PluginInitializer.Name)
     {
         this.windowSystem = windowSystem;
         this.dalamud = dalamud;
@@ -153,6 +164,7 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         this.mapChangeHandler = mapChangeHandler;
         this.configuration = configuration;
         this.configWindow = configWindow;
+        this.roomCatalog = roomCatalog;
 
         var version = GetType().Assembly.GetName().Version?.ToString() ?? string.Empty;
         this.windowName = PluginInitializer.Name;
@@ -262,10 +274,16 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         }
         else
         {
-            // Single zone-based voice channel routed through the existing public-room
-            // join path. The presenter routes JoinVoiceRoom → JoinPublicVoiceRoom when
-            // PublicRoom.Value is true, so make sure that's set.
-            this.PublicRoom.Value = true;
+            // Mode toggle drives whether the presenter routes JoinVoiceRoom
+            // → JoinPublicVoiceRoom (Zone) or JoinPrivateVoiceRoom (Private).
+            // Selection persists via Configuration.PublicRoom (already bound
+            // through the presenter's Bind helper) so the choice survives
+            // restarts. While in a room the toggle is hidden — you can't
+            // switch modes mid-session, just Leave first.
+            if (!this.voiceRoomManager.InRoom)
+            {
+                DrawRoomModeToggle();
+            }
 
             DrawVoiceChannel();
         }
@@ -322,6 +340,250 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         DrawReportModal();
         DrawReportSubmittedModal();
         DrawKickedByAdminModal();
+    }
+
+    // ── room mode toggle (Zone vs Private) ───────────────────────────────────
+    /// <summary>
+    /// Renders the "Mode: Zone / Private" radio row above the voice-channel
+    /// section. Only drawn when not currently in a room (you can't switch
+    /// mid-session). Writing to <c>PublicRoom.Value</c> trips the
+    /// presenter's binding to <c>Configuration.PublicRoom</c> so the
+    /// selection persists across plugin reloads.
+    /// </summary>
+    private void DrawRoomModeToggle()
+    {
+        ImGui.TextUnformatted("Mode:");
+        ImGui.SameLine();
+        var isZone = this.PublicRoom.Value;
+        if (ImGui.RadioButton("Zone##room-mode-zone", isZone))
+        {
+            this.PublicRoom.Value = true;
+            // Same defensive clear the presenter does on the public-room
+            // checkbox path — a stale per-server error from a previous
+            // private-room join attempt shouldn't follow the user into the
+            // public flow.
+            this.voiceRoomManager.SignalingChannel?.ClearLatestError();
+            ResetRoomCatalogAutoRefresh();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Auto-join the public voice channel for whatever zone / instance you're currently in.");
+        }
+        ImGui.SameLine();
+        if (ImGui.RadioButton("Private##room-mode-private", !isZone))
+        {
+            this.PublicRoom.Value = false;
+            this.voiceRoomManager.SignalingChannel?.ClearLatestError();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "Join a named private room with a password. The first user\n" +
+                "to join with a given name + password creates the room; others\n" +
+                "joining with the matching password get in. Leaves persist the\n" +
+                "room name + password for the next session.");
+        }
+        ImGui.Spacing();
+    }
+
+    /// <summary>
+    /// v4 private-room inputs: free-form Name, optional unmasked Password,
+    /// Unlisted toggle, browse list + Refresh, Join button. Drawn inline as
+    /// a replacement for the zone-channel row when the user has selected
+    /// Private mode and isn't in a room yet.
+    ///
+    /// Design notes:
+    ///   * Password is shown in plaintext (no <c>ImGuiInputTextFlags.Password</c>
+    ///     mask) per user request — it makes re-entry less error-prone.
+    ///   * Password can be blank → room has no password gate.
+    ///   * "Unlisted" toggle drives <c>Configuration.RoomUnlisted</c> and is
+    ///     sent as the <c>listed</c> arg of the v4 <c>ready</c> emit (server
+    ///     hides unlisted rooms from <c>/api/rooms/listed</c>).
+    ///   * The browse list polls <c>/api/rooms/listed</c> via
+    ///     <see cref="WebRTC.PrivateRoomCatalog"/>. First entry to Private
+    ///     mode auto-refreshes; subsequent refreshes come from the Refresh
+    ///     button. Clicking a row copies the room name into the input
+    ///     (Refresh-then-Join cuts to two clicks).
+    ///   * Per-world uniqueness is enforced server-side; the world suffix is
+    ///     supplied by the presenter from <see cref="GetCurrentWorldDisplayName"/>
+    ///     so the client never has to think about which world is "current".
+    /// </summary>
+    private void DrawPrivateRoomInputs(bool connecting)
+    {
+        // ── Row 1: Name input + Join button on the right. ───────────────────
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+        ImGui.TextUnformatted("Name:");
+        ImGui.SameLine();
+        var roomName = this.RoomName.Value ?? string.Empty;
+        var btnW = 60f;
+        var nameInputW = ImGui.GetContentRegionAvail().X - btnW - 12f;
+        ImGui.SetNextItemWidth(nameInputW);
+        if (ImGui.InputText("##private-room-name", ref roomName, 64,
+            ImGuiInputTextFlags.AutoSelectAll))
+        {
+            this.RoomName.Value = roomName;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "Name of the private voice room. Free-form; the server\n" +
+                "suffixes your current world automatically so the same name\n" +
+                "on different worlds doesn't collide. Persists between sessions.");
+        }
+        ImGui.SameLine(0, 8);
+        {
+            using var dis = ImRaii.Disabled(connecting || string.IsNullOrWhiteSpace(roomName));
+            using var bc = ImRaii.PushColor(ImGuiCol.Button, Vector4Colors.JoinButton);
+            using var bhc = ImRaii.PushColor(ImGuiCol.ButtonHovered, Vector4Colors.JoinButtonHover);
+            if (ImGui.Button(connecting ? "...##voice-private" : "Join##voice-private", new Vector2(btnW, 0)))
+            {
+                this.joinVoiceRoom.OnNext(Unit.Default);
+            }
+        }
+
+        // ── Row 2: Password input (unmasked, optional). ─────────────────────
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+        ImGui.TextUnformatted("Pwd: ");
+        ImGui.SameLine();
+        var roomPassword = this.RoomPassword.Value ?? string.Empty;
+        ImGui.SetNextItemWidth(nameInputW);
+        // CharsNoBlank still applied — the server's normalization doesn't
+        // strip whitespace, and accidental trailing spaces would silently
+        // change the password without the user noticing. Plaintext (no
+        // Password flag) is intentional per the v4 UX brief.
+        if (ImGui.InputText("##private-room-password", ref roomPassword, 64,
+            ImGuiInputTextFlags.CharsNoBlank | ImGuiInputTextFlags.AutoSelectAll))
+        {
+            this.RoomPassword.Value = roomPassword;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Password for the room. Leave blank to create / join a room with no password.");
+        }
+
+        // ── Row 3: Unlisted toggle. ─────────────────────────────────────────
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+        var unlisted = this.RoomUnlisted.Value;
+        if (ImGui.Checkbox("Unlisted##private-room-unlisted", ref unlisted))
+        {
+            this.RoomUnlisted.Value = unlisted;
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip(
+                "When checked, your room is hidden from the public browse\n" +
+                "list below. Joiners need to know the exact name to enter.\n" +
+                "When unchecked (default), the room shows up in the list.");
+        }
+
+        // ── Row 4+: Browse list of listed rooms. ────────────────────────────
+        ImGui.Spacing();
+        DrawPrivateRoomBrowseList();
+    }
+
+    /// <summary>
+    /// v4 browse list. Fetches on first entry into Private mode and on
+    /// explicit Refresh. Click a row to copy its name into the input so the
+    /// user can adjust the password (if any) before joining.
+    /// </summary>
+    private void DrawPrivateRoomBrowseList()
+    {
+        // One-shot auto-refresh when the user enters Private mode for the
+        // first time in this session. Subsequent visits use cached results
+        // unless the user clicks Refresh.
+        if (!this.autoRefreshedRoomCatalogOnce
+            && this.roomCatalog.Status == WebRTC.PrivateRoomCatalog.CatalogStatus.Idle)
+        {
+            this.autoRefreshedRoomCatalogOnce = true;
+            this.roomCatalog.RefreshAsync().SafeFireAndForget(_ => { });
+        }
+
+        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+        ImGui.TextColored(new Vector4(0.75f, 0.75f, 0.75f, 1f), "Available rooms:");
+        ImGui.SameLine();
+        using (var dis = ImRaii.Disabled(this.roomCatalog.Status == WebRTC.PrivateRoomCatalog.CatalogStatus.Loading))
+        {
+            var btnW = 80f;
+            ImGui.SameLine(0, ImGui.GetContentRegionAvail().X - btnW - 4f);
+            if (ImGui.Button("Refresh##room-catalog", new Vector2(btnW, 0)))
+            {
+                this.roomCatalog.RefreshAsync().SafeFireAndForget(_ => { });
+            }
+        }
+
+        var status = this.roomCatalog.Status;
+        if (status == WebRTC.PrivateRoomCatalog.CatalogStatus.Loading)
+        {
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 16);
+            ImGui.TextColored(new Vector4(0.65f, 0.65f, 0.65f, 1f), "Loading...");
+            return;
+        }
+        if (status == WebRTC.PrivateRoomCatalog.CatalogStatus.Failed)
+        {
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 16);
+            var err = string.IsNullOrWhiteSpace(this.roomCatalog.LastErrorMessage)
+                ? "Couldn't load the room list."
+                : $"Couldn't load the room list: {this.roomCatalog.LastErrorMessage}";
+            ImGui.TextColored(new Vector4(0.95f, 0.6f, 0.6f, 1f), err);
+            return;
+        }
+
+        var rooms = this.roomCatalog.Rooms;
+        if (rooms.Count == 0)
+        {
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 16);
+            ImGui.TextColored(new Vector4(0.65f, 0.65f, 0.65f, 1f), "No public rooms right now.");
+            return;
+        }
+
+        // The catalog can be large (cap is 5000 listed entries). Wrap the
+        // list in a fixed-height scroll region — about 5 rows visible —
+        // so it doesn't push the rest of the window off screen.
+        var rowHeight = ImGui.GetTextLineHeightWithSpacing();
+        var maxRows = Math.Min(rooms.Count, 6);
+        var listHeight = rowHeight * maxRows + 8f;
+        using (var child = ImRaii.Child("##room-catalog-scroll", new Vector2(ImGui.GetContentRegionAvail().X - 4f, listHeight), true))
+        {
+            if (child.Success)
+            {
+                foreach (var room in rooms)
+                {
+                    // One Selectable per row: clicking copies the display name
+                    // into the Name input so the user can fill in the password
+                    // (if any) and click Join.
+                    var label = room.HasPassword
+                        ? $"{room.DisplayName}  ({room.PeerCount})  [pwd]"
+                        : $"{room.DisplayName}  ({room.PeerCount})";
+                    // ##unique id includes world + name so two rooms with the
+                    // same display name on different worlds don't collide as
+                    // ImGui widget ids.
+                    var rowId = $"##room-{room.World}-{room.DisplayName}";
+                    if (ImGui.Selectable(label + rowId))
+                    {
+                        this.RoomName.Value = room.DisplayName;
+                        // Don't auto-clear or auto-fill the password — the user
+                        // either knows it or they don't, and the saved value
+                        // might be right (re-join with the same name).
+                    }
+                    if (ImGui.IsItemHovered())
+                    {
+                        var occupancy = room.PeerCount == 1 ? "1 player" : $"{room.PeerCount} players";
+                        var pwHint = room.HasPassword ? " — password required" : " — open (no password)";
+                        ImGui.SetTooltip($"{room.DisplayName}@{room.World} · {occupancy}{pwHint}\nClick to fill in the name.");
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Resets the once-per-mode-entry auto-refresh flag so the next time the
+    /// user opens Private mode the catalog refreshes again. Called when the
+    /// user leaves a room or flips back to Zone mode.
+    /// </summary>
+    private void ResetRoomCatalogAutoRefresh()
+    {
+        this.autoRefreshedRoomCatalogOnce = false;
     }
 
     // ── voice channel row + peer roster ──────────────────────────────────────
@@ -388,49 +650,76 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
         }
         int count = rosterMaterialized.Count;
 
-        if (inRoom)
+        // Private mode + not yet in a room: render Name + Password inputs
+        // INSTEAD of the zone-channel row, with the same Join button on the
+        // right. Existing reactive properties (RoomName / RoomPassword) are
+        // already bound to Configuration in the presenter, so values
+        // persist between sessions.
+        if (!inRoom && !this.PublicRoom.Value)
         {
-            var rowPos = ImGui.GetCursorScreenPos() - new Vector2(4, 2);
-            var rowEnd = rowPos + new Vector2(ImGui.GetContentRegionAvail().X + 8, ImGui.GetTextLineHeightWithSpacing() + 4);
-            dl.AddRectFilled(rowPos, rowEnd, ImGui.ColorConvertFloat4ToU32(Vector4Colors.JoinedBackground));
-        }
-
-        ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
-        using (var iconFont = ImRaii.PushFont(UiBuilder.IconFont))
-        {
-            var icon = inRoom ? FontAwesomeIcon.VolumeUp.ToIconString() : FontAwesomeIcon.VolumeDown.ToIconString();
-            ImGui.TextColored(inRoom ? Vector4Colors.Green : Vector4Colors.Gray, icon);
-        }
-        ImGui.SameLine();
-        // Capture where the channel name's first glyph lands — this is the
-        // X-coordinate that DrawPeerRow uses to align each peer's voice dot.
-        this.channelNameAlignX = ImGui.GetCursorPosX();
-        var countLabel = count > 0 ? $" ({count})" : string.Empty;
-        ImGui.Text($"{channelName}{countLabel}");
-        if (ImGui.IsItemClicked() && !inRoom && !connecting)
-        {
-            this.joinVoiceRoom.OnNext(Unit.Default);
-        }
-
-        var btnW = 60f;
-        ImGui.SameLine(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btnW);
-        if (inRoom)
-        {
-            using var bc = ImRaii.PushColor(ImGuiCol.Button, Vector4Colors.LeaveButton);
-            using var bhc = ImRaii.PushColor(ImGuiCol.ButtonHovered, Vector4Colors.LeaveButtonHover);
-            if (ImGui.Button("Leave##voice", new Vector2(btnW, 0)))
-            {
-                this.leaveVoiceRoom.OnNext(Unit.Default);
-            }
+            DrawPrivateRoomInputs(connecting);
         }
         else
         {
-            using var dis = ImRaii.Disabled(connecting);
-            using var bc = ImRaii.PushColor(ImGuiCol.Button, Vector4Colors.JoinButton);
-            using var bhc = ImRaii.PushColor(ImGuiCol.ButtonHovered, Vector4Colors.JoinButtonHover);
-            if (ImGui.Button(connecting ? "...##voice" : "Join##voice", new Vector2(btnW, 0)))
+            if (inRoom)
+            {
+                var rowPos = ImGui.GetCursorScreenPos() - new Vector2(4, 2);
+                var rowEnd = rowPos + new Vector2(ImGui.GetContentRegionAvail().X + 8, ImGui.GetTextLineHeightWithSpacing() + 4);
+                dl.AddRectFilled(rowPos, rowEnd, ImGui.ColorConvertFloat4ToU32(Vector4Colors.JoinedBackground));
+            }
+
+            // For the in-room display: if we're in a private room, show the
+            // actual room name from the signaling channel (it's just the
+            // user-typed string). For public rooms / not-in-room, the zone @
+            // world derived name from GetVoiceChannelDisplayName() is right.
+            var rowChannelName = channelName;
+            if (inRoom)
+            {
+                var actualRoomName = this.voiceRoomManager.SignalingChannel?.RoomName;
+                if (!string.IsNullOrWhiteSpace(actualRoomName)
+                    && !actualRoomName.StartsWith("public", StringComparison.Ordinal))
+                {
+                    rowChannelName = actualRoomName;
+                }
+            }
+
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + 8);
+            using (var iconFont = ImRaii.PushFont(UiBuilder.IconFont))
+            {
+                var icon = inRoom ? FontAwesomeIcon.VolumeUp.ToIconString() : FontAwesomeIcon.VolumeDown.ToIconString();
+                ImGui.TextColored(inRoom ? Vector4Colors.Green : Vector4Colors.Gray, icon);
+            }
+            ImGui.SameLine();
+            // Capture where the channel name's first glyph lands — this is the
+            // X-coordinate that DrawPeerRow uses to align each peer's voice dot.
+            this.channelNameAlignX = ImGui.GetCursorPosX();
+            var countLabel = count > 0 ? $" ({count})" : string.Empty;
+            ImGui.Text($"{rowChannelName}{countLabel}");
+            if (ImGui.IsItemClicked() && !inRoom && !connecting)
             {
                 this.joinVoiceRoom.OnNext(Unit.Default);
+            }
+
+            var btnW = 60f;
+            ImGui.SameLine(ImGui.GetCursorPosX() + ImGui.GetContentRegionAvail().X - btnW);
+            if (inRoom)
+            {
+                using var bc = ImRaii.PushColor(ImGuiCol.Button, Vector4Colors.LeaveButton);
+                using var bhc = ImRaii.PushColor(ImGuiCol.ButtonHovered, Vector4Colors.LeaveButtonHover);
+                if (ImGui.Button("Leave##voice", new Vector2(btnW, 0)))
+                {
+                    this.leaveVoiceRoom.OnNext(Unit.Default);
+                }
+            }
+            else
+            {
+                using var dis = ImRaii.Disabled(connecting);
+                using var bc = ImRaii.PushColor(ImGuiCol.Button, Vector4Colors.JoinButton);
+                using var bhc = ImRaii.PushColor(ImGuiCol.ButtonHovered, Vector4Colors.JoinButtonHover);
+                if (ImGui.Button(connecting ? "...##voice" : "Join##voice", new Vector2(btnW, 0)))
+                {
+                    this.joinVoiceRoom.OnNext(Unit.Default);
+                }
             }
         }
 
@@ -465,6 +754,27 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                         break;
                     case SignalingChannelError.NonexistentPrivateRoom:
                         ImGui.Text("  Room not found");
+                        break;
+                    case SignalingChannelError.PrivateRoomFull:
+                        ImGui.TextWrapped("  Room is full (24/24). Try again later or pick another room.");
+                        break;
+                    case SignalingChannelError.BannedFromPrivateRoom:
+                        ImGui.TextWrapped("  You have been banned from this room.");
+                        break;
+                    case SignalingChannelError.InvalidPrivateRoomName:
+                    {
+                        // The server's reason is more specific than a generic
+                        // "invalid name" — surface it directly so the user
+                        // knows whether it was too long, contained banned
+                        // content, or implied staff status.
+                        var msg = this.voiceRoomManager.SignalingChannel?.LatestErrorMessage;
+                        ImGui.TextWrapped(string.IsNullOrWhiteSpace(msg)
+                            ? "  Room name is not allowed."
+                            : $"  {msg}");
+                        break;
+                    }
+                    case SignalingChannelError.AlreadyOwnAnotherRoom:
+                        ImGui.TextWrapped("  You already own a private room. Leave it empty for 24h before creating another.");
                         break;
                     case SignalingChannelError.KickedFromChannel:
                     {
@@ -696,6 +1006,65 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
                 {
                     _ = this.voiceRoomManager.SignalingChannel?.SendAdminKickAsync(user);
                     ImGui.CloseCurrentPopup();
+                }
+            }
+
+            // ── Room owner / moderator tools (v4) ──────────────────────
+            // Shown when the local user is the room owner OR a mod, and the
+            // target user is not the room owner. The server validates each
+            // action — a tampered client showing these can't actually do
+            // anything it isn't authorized for.
+            var meta = this.voiceRoomManager.CurrentRoomMeta;
+            var localIsOwner = this.voiceRoomManager.IsLocalRoomOwner;
+            var localIsAuthority = this.voiceRoomManager.IsLocalRoomAuthority;
+            var targetIsOwner = meta != null && meta.Value.OwnerPeerId == user;
+            var targetIsMod = meta != null && meta.Value.Moderators != null && meta.Value.Moderators.Contains(user);
+            if (localIsAuthority && !targetIsOwner)
+            {
+                ImGui.Spacing();
+                ImGui.Separator();
+                ImGui.TextColored(new Vector4(0.5f, 0.85f, 0.95f, 1f),
+                    localIsOwner ? "Room owner tools" : "Room moderator tools");
+                ImGui.Spacing();
+
+                var btnWidth = ImGui.GetContentRegionAvail().X;
+                if (ImGui.Button($"Kick from Room##room-kick-{user}", new Vector2(btnWidth, 26f)))
+                {
+                    _ = this.voiceRoomManager.SignalingChannel?.SendRoomKickAsync(user);
+                    ImGui.CloseCurrentPopup();
+                }
+                ImGui.Spacing();
+                // Mods can't ban other mods (server enforces); hide the button
+                // for that case so the UX matches the enforcement.
+                if (localIsOwner || !targetIsMod)
+                {
+                    if (Common.DrawDangerButton("Ban from Room", new Vector2(btnWidth, 28f)))
+                    {
+                        _ = this.voiceRoomManager.SignalingChannel?.SendRoomBanAsync(user);
+                        ImGui.CloseCurrentPopup();
+                    }
+                }
+
+                // Owner-only: appoint / revoke moderators.
+                if (localIsOwner)
+                {
+                    ImGui.Spacing();
+                    if (targetIsMod)
+                    {
+                        if (ImGui.Button($"Revoke Moderator##room-revoke-mod-{user}", new Vector2(btnWidth, 26f)))
+                        {
+                            _ = this.voiceRoomManager.SignalingChannel?.SendRoomRevokeModAsync(user);
+                            ImGui.CloseCurrentPopup();
+                        }
+                    }
+                    else
+                    {
+                        if (ImGui.Button($"Appoint Moderator##room-appoint-mod-{user}", new Vector2(btnWidth, 26f)))
+                        {
+                            _ = this.voiceRoomManager.SignalingChannel?.SendRoomAppointModAsync(user);
+                            ImGui.CloseCurrentPopup();
+                        }
+                    }
                 }
             }
 
@@ -1247,7 +1616,17 @@ public sealed class MainWindow : Window, IPluginUIView, IDisposable
     {
         this.configuration.SyncActiveCharacterProfile();
         var name = GetLocalPlayerDisplayName();
-        var jobLine = GetPlayerJobAndLevelLine(name);
+        // v1.1.6 footer change: the under-name gray line now shows the
+        // server-wide "Users Online" count (broadcast by the server every 5s
+        // via the v4 onlineCount event). The old class/level readout
+        // (GetPlayerJobAndLevelLine) was per-character flavour text; users
+        // are more interested in whether anyone else is on the server right
+        // now. Fallback "Users Online: …" while we wait for the first
+        // broadcast (or when disconnected).
+        var onlineCount = this.voiceRoomManager.SignalingChannel?.LastOnlineCount;
+        var jobLine = onlineCount.HasValue
+            ? $"Users Online: {onlineCount.Value}"
+            : "Users Online: …";
         // Custom name color is a supporter perk. Non-premium falls back to
         // plain white so the footer looks the same as everyone else's view.
         var profileColor = this.configuration.IsLocalPremium

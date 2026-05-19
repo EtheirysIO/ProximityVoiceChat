@@ -39,10 +39,17 @@ public sealed class SignalingChannel : IDisposable
     ///         successful <c>ready</c>. v3 clients keep the Socket.IO <c>audio</c>
     ///         subscription as a TCP fallback for the cases where UDP can't be
     ///         established (corporate firewall, restrictive ISP, NAT failure).
-    /// The server accepts both v2 and v3 clients in the same room; it cross-
-    /// stitches the fan-out so a v2 peer hears a v3 peer and vice versa.
+    ///   • v4: private rooms overhaul — free-form display names suffixed by
+    ///         <c>@CurrentWorld</c>, optional password, "unlisted" flag,
+    ///         browse list via <c>/api/rooms/listed</c>, owner / moderator
+    ///         model (room-level kick / ban), 24-peer cap, 24-hour empty-room
+    ///         TTL. The <c>ready</c> emit now carries two new positional args
+    ///         (<c>listed</c>, <c>currentWorld</c>); the server emits
+    ///         <c>roomMeta</c> push events to owners/mods on moderation changes.
+    /// The server accepts v2/v3/v4 clients in the same room; it cross-stitches
+    /// the fan-out so peers on different protocol versions still hear each other.
     /// </summary>
-    public const string ProtocolVersion = "3";
+    public const string ProtocolVersion = "4";
 
     // Since Dalamud 12, for some reason accessing socket parameters such as socket.Connected from the UI thread
     // would crash the game. So, intermediate field booleans are now used to indicate state to the UI.
@@ -107,6 +114,28 @@ public sealed class SignalingChannel : IDisposable
     /// </summary>
     internal event Action<UdpCredentials>? OnUdpCredentialsReceived;
 
+    /// <summary>
+    /// v4 only. Server pushes a meta snapshot (owner, moderators, bans,
+    /// listed, hasPassword) to room authorities (owner + mods) on every
+    /// moderation change. Subscribers should cache the latest snapshot and
+    /// refresh the manage-room UI.
+    /// </summary>
+    public event Action<RoomMetaSnapshot>? OnRoomMeta;
+
+    /// <summary>
+    /// v4 only. Server broadcasts a server-wide "users online" count every
+    /// 5 s. Subscribers should debounce on the consumer side if they're
+    /// driving anything more expensive than a TextUnformatted.
+    /// </summary>
+    public event Action<int>? OnOnlineCount;
+
+    /// <summary>
+    /// Latest <c>onlineCount</c> received from the server. Null until the
+    /// first broadcast lands. Cleared on disconnect so the UI can hide the
+    /// line while disconnected.
+    /// </summary>
+    public int? LastOnlineCount { get; private set; }
+
     public event Action? OnDisconnected;
     public event Action? OnErrored;
 
@@ -129,6 +158,11 @@ public sealed class SignalingChannel : IDisposable
     private CancellationTokenSource? pingCts;
     private string? roomPassword;
     private string[]? playersInInstance;
+    // v4: extra positional args sent with the `ready` emit. `listed` defaults to
+    // true (legacy behaviour) and `currentWorld` is "" for public-room joins;
+    // the server ignores both for public rooms.
+    private bool roomListed = true;
+    private string? roomCurrentWorld;
     private bool connecting;
     // Connecting to an empty room may not send back a "Ready" reply, so don't rely on this for connection state
     private bool ready;
@@ -150,7 +184,7 @@ public sealed class SignalingChannel : IDisposable
         this.verbose = verbose;
     }
 
-    public Task ConnectAsync(string roomName, string roomPassword, string[]? playersInInstance)
+    public Task ConnectAsync(string roomName, string roomPassword, string[]? playersInInstance, bool listed = true, string? currentWorld = null)
     {
         if (this.socket == null)
         {
@@ -185,6 +219,8 @@ public sealed class SignalingChannel : IDisposable
         this.RoomName = roomName;
         this.roomPassword = roomPassword;
         this.playersInInstance = playersInInstance;
+        this.roomListed = listed;
+        this.roomCurrentWorld = currentWorld;
         return this.socket.ConnectAsync(this.disconnectCts.Token);
     }
 
@@ -298,6 +334,8 @@ public sealed class SignalingChannel : IDisposable
         this.OnMessage = null;
         this.OnAudioFrame = null;
         this.OnUdpCredentialsReceived = null;
+        this.OnRoomMeta = null;
+        this.OnOnlineCount = null;
         this.OnDisconnected = null;
         this.OnLatencyUpdated = null;
         this.DisposeSocket();
@@ -319,6 +357,8 @@ public sealed class SignalingChannel : IDisposable
             this.socket.On("adminStatus", this.OnAdminStatusCallback);
             this.socket.On("muteState", this.OnMuteStateCallback);
             this.socket.On("udpCredentials", this.OnUdpCredentialsCallback);
+            this.socket.On("roomMeta", this.OnRoomMetaCallback);
+            this.socket.On("onlineCount", this.OnOnlineCountCallback);
         }
     }
 
@@ -338,9 +378,12 @@ public sealed class SignalingChannel : IDisposable
             this.socket.Off("adminStatus");
             this.socket.Off("muteState");
             this.socket.Off("udpCredentials");
+            this.socket.Off("roomMeta");
+            this.socket.Off("onlineCount");
             this.socket.Dispose();
         }
         this.socket = null;
+        this.LastOnlineCount = null;
     }
 
     /// <summary>
@@ -380,6 +423,8 @@ public sealed class SignalingChannel : IDisposable
         sock.Off("adminStatus");
         sock.Off("muteState");
         sock.Off("udpCredentials");
+        sock.Off("roomMeta");
+        sock.Off("onlineCount");
 
         Task.Run(() =>
         {
@@ -415,7 +460,22 @@ public sealed class SignalingChannel : IDisposable
             }
             this.connecting = false;
             this.OnConnected?.Invoke();
-            this.socket.EmitAsync("ready", this.PeerId, this.PeerType, this.RoomName, this.roomPassword, this.playersInInstance, this.PremiumToken ?? string.Empty)
+            // v4 ready signature: peerId, peerType, roomName, roomPassword,
+            // playersInInstance, premiumToken, listed, currentWorld.
+            // The server tolerates the extra trailing args from older v2/v3
+            // emits (Socket.IO handler params get padded with undefined), but
+            // v4 clients MUST send them or private-room create/join is
+            // rejected on the server side with "Invalid or missing world."
+            this.socket.EmitAsync(
+                "ready",
+                this.PeerId,
+                this.PeerType,
+                this.RoomName,
+                this.roomPassword,
+                this.playersInInstance,
+                this.PremiumToken ?? string.Empty,
+                this.roomListed,
+                this.roomCurrentWorld ?? string.Empty)
                 .SafeFireAndForget(ex => this.logger.Error(ex.ToString()));
             StartLatencyPingLoop();
         }
@@ -790,12 +850,141 @@ public sealed class SignalingChannel : IDisposable
         catch (Exception ex) { this.logger.Debug("OnLatencyUpdated threw: {0}", ex.Message); }
     }
 
+    /// <summary>
+    /// v4 only. Server pushes <c>roomMeta</c> snapshots to authorities on
+    /// moderation changes. Subscribers re-render the manage-room UI.
+    /// </summary>
+    private void OnRoomMetaCallback(SocketIOResponse response)
+    {
+        try
+        {
+            var payload = response.GetValue<RoomMetaPayload>();
+            this.OnRoomMeta?.Invoke(new RoomMetaSnapshot
+            {
+                OwnerPeerId = payload.ownerPeerId ?? string.Empty,
+                Moderators = payload.moderators ?? Array.Empty<string>(),
+                BannedPeerIds = payload.bannedPeerIds ?? Array.Empty<string>(),
+                Listed = payload.listed,
+                HasPassword = payload.hasPassword,
+            });
+        }
+        catch (Exception ex)
+        {
+            this.logger.Debug("roomMeta parse failed: {0}", ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// v4 only. Server broadcasts the server-wide online count every 5 s.
+    /// </summary>
+    private void OnOnlineCountCallback(SocketIOResponse response)
+    {
+        try
+        {
+            // Server emits the value as a bare integer (`io.emit("onlineCount", N)`)
+            // — pull it out of slot 0.
+            var n = response.GetValue<int>(0);
+            this.LastOnlineCount = n;
+            this.OnOnlineCount?.Invoke(n);
+        }
+        catch (Exception ex)
+        {
+            this.logger.Debug("onlineCount parse failed: {0}", ex.Message);
+        }
+    }
+
+#pragma warning disable CS0649 // deserialized via reflection — see PremiumStatusPayload
+    private struct RoomMetaPayload
+    {
+        public string? ownerPeerId;
+        public string[]? moderators;
+        public string[]? bannedPeerIds;
+        public bool listed;
+        public bool hasPassword;
+    }
+#pragma warning restore CS0649
+
+    /// <summary>
+    /// Cached parsed shape of the server's <c>roomMeta</c> snapshot. Held by
+    /// consumers (e.g. <c>MainWindow</c>) so the manage-room UI can re-render
+    /// without a round-trip on every frame.
+    /// </summary>
+    public readonly struct RoomMetaSnapshot
+    {
+        public string OwnerPeerId { get; init; }
+        public IReadOnlyList<string> Moderators { get; init; }
+        public IReadOnlyList<string> BannedPeerIds { get; init; }
+        public bool Listed { get; init; }
+        public bool HasPassword { get; init; }
+    }
+
+    /// <summary>
+    /// v4 owner/mod: kick a peer from the room. They can reconnect immediately
+    /// unless they're also banned (see <see cref="SendRoomBanAsync"/>).
+    /// </summary>
+    public Task SendRoomKickAsync(string targetPeerId)
+    {
+        if (this.socket == null || !this.socket.Connected) return Task.CompletedTask;
+        return this.socket.EmitAsync("roomKick", new RoomTargetPayload { peerId = targetPeerId });
+    }
+
+    /// <summary>
+    /// v4 owner/mod: ban a peer from the room. Kicks them (if present) and
+    /// rejects future re-join attempts with the same peerId.
+    /// </summary>
+    public Task SendRoomBanAsync(string targetPeerId)
+    {
+        if (this.socket == null || !this.socket.Connected) return Task.CompletedTask;
+        return this.socket.EmitAsync("roomBan", new RoomTargetPayload { peerId = targetPeerId });
+    }
+
+    /// <summary>v4 owner/mod: undo a ban.</summary>
+    public Task SendRoomUnbanAsync(string targetPeerId)
+    {
+        if (this.socket == null || !this.socket.Connected) return Task.CompletedTask;
+        return this.socket.EmitAsync("roomUnban", new RoomTargetPayload { peerId = targetPeerId });
+    }
+
+    /// <summary>v4 owner only: appoint a moderator.</summary>
+    public Task SendRoomAppointModAsync(string targetPeerId)
+    {
+        if (this.socket == null || !this.socket.Connected) return Task.CompletedTask;
+        return this.socket.EmitAsync("roomAppointMod", new RoomTargetPayload { peerId = targetPeerId });
+    }
+
+    /// <summary>v4 owner only: revoke a moderator.</summary>
+    public Task SendRoomRevokeModAsync(string targetPeerId)
+    {
+        if (this.socket == null || !this.socket.Connected) return Task.CompletedTask;
+        return this.socket.EmitAsync("roomRevokeMod", new RoomTargetPayload { peerId = targetPeerId });
+    }
+
+    private struct RoomTargetPayload
+    {
+        public string peerId;
+    }
+
     private void OnServerDisconnect(SocketIOResponse response)
     {
-        var errorMsg = response.GetValue<SignalDisconnectMessage>().message;
+        var msg = response.GetValue<SignalDisconnectMessage>();
+        var errorMsg = msg.message ?? string.Empty;
+        var reason = msg.reason ?? string.Empty;
         this.LatestErrorMessage = errorMsg;
 
-        if (errorMsg.Contains("incorrect password", StringComparison.OrdinalIgnoreCase))
+        // Prefer the structured `reason` discriminator over substring matching
+        // on the message. v4 server emits codes for the cases that the plugin
+        // needs to distinguish; we still fall back to the substring sniff for
+        // legacy v3 messages and any case the server didn't tag.
+        if (reason.Equals("room-full", StringComparison.OrdinalIgnoreCase))
+        {
+            this.LatestError = SignalingChannelError.PrivateRoomFull;
+        }
+        else if (reason.Equals("banned", StringComparison.OrdinalIgnoreCase))
+        {
+            this.LatestError = SignalingChannelError.BannedFromPrivateRoom;
+        }
+        else if (reason.Equals("bad-password", StringComparison.OrdinalIgnoreCase)
+              || errorMsg.Contains("incorrect password", StringComparison.OrdinalIgnoreCase))
         {
             this.LatestError = SignalingChannelError.IncorrectPrivateRoomPassword;
         }
@@ -803,7 +992,18 @@ public sealed class SignalingChannel : IDisposable
         {
             this.LatestError = SignalingChannelError.NonexistentPrivateRoom;
         }
-        else if (errorMsg.Contains("kicked", StringComparison.OrdinalIgnoreCase))
+        else if (errorMsg.Contains("already own", StringComparison.OrdinalIgnoreCase))
+        {
+            this.LatestError = SignalingChannelError.AlreadyOwnAnotherRoom;
+        }
+        else if (errorMsg.Contains("Room name", StringComparison.OrdinalIgnoreCase)
+              || errorMsg.Contains("Invalid or missing world", StringComparison.OrdinalIgnoreCase))
+        {
+            this.LatestError = SignalingChannelError.InvalidPrivateRoomName;
+        }
+        else if (reason.Contains("kicked", StringComparison.OrdinalIgnoreCase)
+              || reason.Equals("room-kicked", StringComparison.OrdinalIgnoreCase)
+              || errorMsg.Contains("kicked", StringComparison.OrdinalIgnoreCase))
         {
             this.LatestError = SignalingChannelError.KickedFromChannel;
         }

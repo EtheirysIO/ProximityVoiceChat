@@ -63,6 +63,8 @@ public class MainWindowPresenter(
             s => { this.configuration.RoomName = s; this.configuration.Save(); }, this.configuration.RoomName);
         Bind(this.view.RoomPassword,
             s => { this.configuration.RoomPassword = s; this.configuration.Save(); }, this.configuration.RoomPassword);
+        Bind(this.view.RoomUnlisted,
+            b => { this.configuration.RoomUnlisted = b; this.configuration.Save(); }, this.configuration.RoomUnlisted);
     }
 
     private void BindActions()
@@ -87,17 +89,28 @@ public class MainWindowPresenter(
             }
             else
             {
-                if (string.IsNullOrEmpty(this.view.RoomName.Value))
+                // v4 private rooms are free-form. The user types whatever they
+                // want; we don't autofill with the character name any more.
+                // The server validates length / blocklist and rejects with
+                // SignalingChannelError.InvalidPrivateRoomName on failure.
+                var roomName = (this.view.RoomName.Value ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(roomName))
                 {
-                    var playerName = this.dalamud.PlayerState.GetLocalPlayerFullName();
-                    if (playerName == null)
-                    {
-                        this.logger.Error("Player name is null, cannot autofill private room name.");
-                        return;
-                    }
-                    this.view.RoomName.Value = playerName;
+                    this.logger.Info("Private room name is empty, ignoring Join click.");
+                    return;
                 }
-                this.voiceRoomManager.JoinPrivateVoiceRoom(this.view.RoomName.Value, this.view.RoomPassword.Value);
+                var currentWorld = GetCurrentWorldName();
+                if (string.IsNullOrWhiteSpace(currentWorld))
+                {
+                    this.logger.Error("Current world is not available — try again after the game finishes loading.");
+                    return;
+                }
+                var listed = !this.view.RoomUnlisted.Value;
+                this.voiceRoomManager.JoinPrivateVoiceRoom(
+                    roomName,
+                    this.view.RoomPassword.Value ?? string.Empty,
+                    listed,
+                    currentWorld);
             }
         });
 
@@ -115,6 +128,25 @@ public class MainWindowPresenter(
             }
             this.configuration.Save();
         });
+    }
+
+    /// <summary>
+    /// v4 private rooms need the *current* world (where the character is
+    /// physically standing, not their home world). Used to suffix the
+    /// user-typed room name with <c>@World</c> on the server side. Returns
+    /// empty string if the world isn't available yet (e.g. mid-loading).
+    /// </summary>
+    private string GetCurrentWorldName()
+    {
+        try
+        {
+            var world = this.dalamud.PlayerState.CurrentWorld;
+            return world.IsValid ? world.Value.Name.ExtractText() ?? string.Empty : string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     private void Bind<T>(

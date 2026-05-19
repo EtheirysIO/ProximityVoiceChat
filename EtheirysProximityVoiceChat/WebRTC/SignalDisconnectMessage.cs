@@ -17,4 +17,11 @@ namespace EtheirysProximityVoiceChat.WebRTC;
 public struct SignalDisconnectMessage
 {
     public string message;
+    /// <summary>
+    /// v4 only. Optional discriminator the server includes alongside
+    /// <see cref="message"/> so the plugin can distinguish "room full",
+    /// "banned", "bad password", "kicked", etc. without substring sniffing
+    /// the human-readable message. May be null/empty for legacy emits.
+    /// </summary>
+    public string? reason;
 }

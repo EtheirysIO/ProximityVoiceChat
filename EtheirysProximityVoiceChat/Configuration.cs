@@ -35,6 +35,15 @@ public class Configuration : IPluginConfiguration
     public string RoomName { get; set; } = string.Empty;
     public string RoomPassword { get; set; } = string.Empty;
 
+    /// <summary>
+    /// v4 private-room flag. When true, this room is hidden from the browse
+    /// list on /api/rooms/listed — joiners need to know the name. Default
+    /// false (= listed). Stored alongside RoomName/RoomPassword so the user's
+    /// chosen visibility persists across sessions just like the password.
+    /// Ignored by public/zone mode.
+    /// </summary>
+    public bool RoomUnlisted { get; set; } = false;
+
     public int SelectedAudioInputDeviceIndex { get; set; } = -1;
     public int SelectedAudioOutputDeviceIndex { get; set; } = -1;
 

@@ -25,6 +25,7 @@ using EtheirysProximityVoiceChat.Premium;
 using EtheirysProximityVoiceChat.UI;
 using EtheirysProximityVoiceChat.UI.Presenter;
 using EtheirysProximityVoiceChat.UI.View;
+using EtheirysProximityVoiceChat.WebRTC;
 
 namespace EtheirysProximityVoiceChat.Ninject;
 
@@ -67,6 +68,7 @@ public class PluginModule : NinjectModule
         Bind<Spatializer>().ToSelf().InSingletonScope();
         Bind<MapManager>().ToSelf().InSingletonScope();
         Bind<PremiumLinker>().ToSelf().InSingletonScope();
+        Bind<PrivateRoomCatalog>().ToSelf().InSingletonScope();
 
         // Views and Presenters
         Bind<WindowSystem>().ToMethod(_ => new(PluginInitializer.Name)).InSingletonScope();
