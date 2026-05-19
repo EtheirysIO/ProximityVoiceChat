@@ -302,8 +302,10 @@ public sealed class ConfigWindow : Window, IPluginUIView, IDisposable
             {
                 ImGui.SetTooltip(
                     "Quality (0): picks up quieter speech, lets more through.\n" +
-                    "Aggressive (2): default, balanced.\n" +
-                    "Very Aggressive (3): rejects more background noise, requires louder speech.\n" +
+                    "Aggressive (2): balanced — old default.\n" +
+                    "Very Aggressive (3): default. Rejects keyboard / room\n" +
+                    "  noise most reliably; requires louder speech to open\n" +
+                    "  the gate. Slide here if typing leaks through.\n" +
                     "\n" +
                     "Requires Noise Suppression to be enabled.\n" +
                     "Push-to-Talk overrides voice-activated pickup.");

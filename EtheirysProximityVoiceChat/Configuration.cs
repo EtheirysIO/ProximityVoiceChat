@@ -72,13 +72,17 @@ public class Configuration : IPluginConfiguration
     /// <c>WebRtcVadSharp.OperatingMode</c>:
     /// 0 = Quality (most sensitive, picks up quieter speech),
     /// 1 = LowBitrate,
-    /// 2 = Aggressive (default, preserves current behavior),
-    /// 3 = VeryAggressive (least sensitive, rejects more background).
+    /// 2 = Aggressive,
+    /// 3 = VeryAggressive (default — rejects keyboard / room noise most
+    ///     reliably; bumped from Aggressive after users reported typing
+    ///     leaking through during silence).
     /// Only effective when <see cref="SuppressNoise"/> is true; the VAD gate
     /// at <c>AudioDeviceController.OnAudioSourceDataAvailable</c> is skipped
-    /// when suppression is off.
+    /// when suppression is off. Users on a pre-existing config keep whatever
+    /// value they had saved — the new default only applies to fresh installs
+    /// and to the "Reset to Defaults" button.
     /// </summary>
-    public int VadSensitivity { get; set; } = 2;
+    public int VadSensitivity { get; set; } = 3;
 
     public bool MuteMic { get; set; }
     public bool Deafen { get; set; }
